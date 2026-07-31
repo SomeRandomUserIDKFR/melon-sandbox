@@ -153,7 +153,8 @@ export function tickSqueezer(squeezer, world, dt, particles) {
 
     const tank = squeezer.plugin.liquid;
     const color = vessel?.color || skinned[0].plugin.fruit?.juice || "#b8e86a";
-    addLiquid(tank, yieldAmt, "juice", color);
+    const fruitKey = skinned[0].plugin.fruitKey || "melon";
+    addLiquid(tank, yieldAmt, "juice", color, { fruitKey });
 
     // Drain proportional juice from the living
     if (vessel) {

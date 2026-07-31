@@ -45,6 +45,7 @@ import {
   isHandPart,
   isPreferredHand,
   isGrabbable,
+  isOwnedHold,
   releaseGrip,
   findNearestHand,
   findNearestGrabbable,
@@ -62,13 +63,20 @@ import {
   setNetSeq,
 } from "./multiplayer.js";
 import { createSqueezer, tickSqueezer } from "./squeezer.js";
+import { createGraftVat, tickGraftVat } from "./skinRestorer.js";
+import { createLimbRegrower, tickLimbRegrower } from "./limbRegrower.js";
+import { createBodyGrower, tickBodyGrower } from "./bodyGrower.js";
 import {
   createBoneMelter,
   tickBoneMelter,
+  createMetalMelter,
+  tickMetalMelter,
   createBoneMold,
   tickBoneMold,
   createBoneReconnector,
   tickBoneReconnector,
+  createBoneRepairer,
+  tickBoneRepairer,
   BONE_MOLDS,
 } from "./boneMachines.js";
 import {
@@ -159,6 +167,8 @@ const PROPS = [
   { id: "crate", label: "Pixelcrate", kind: "prop", color: "#a07848", icon: "▤" },
   { id: "plank", label: "Plank", kind: "prop", color: "#6e5840", icon: "—" },
   { id: "metal", label: "Beam", kind: "prop", color: "#7a8088", icon: "=" },
+  { id: "metalRod", label: "Metal Rod", kind: "prop", color: "#8a949e", icon: "|" },
+  { id: "metalPlate", label: "Metal Plate", kind: "prop", color: "#6a747e", icon: "▭" },
   { id: "weight", label: "Weight", kind: "prop", color: "#4a4e54", icon: "●" },
   { id: "barrel", label: "Barrel", kind: "prop", color: "#6a5a28", icon: "▥" },
   { id: "tank", label: "Tank", kind: "prop", color: "#4a7a88", icon: "▣" },
@@ -176,6 +186,7 @@ const PROPS = [
 const ELEMENTS = [
   { id: "water", label: "Water", kind: "element", color: "#3a8ab0", icon: "~" },
   { id: "lava", label: "Lava", kind: "element", color: "#d05020", icon: "~" },
+  { id: "acid", label: "Acid", kind: "element", color: "#8ab030", icon: "~" },
   { id: "torch", label: "Torch", kind: "element", color: "#c06020", icon: "!" },
   { id: "firebarrel", label: "Firecan", kind: "element", color: "#a04018", icon: "▥" },
   { id: "watercan", label: "Watercan", kind: "element", color: "#4a90b0", icon: "▥" },
@@ -198,12 +209,17 @@ const MACHINES = [
   { id: "button", label: "Button", kind: "machine", color: "#d05050", icon: "●" },
   { id: "toggle", label: "Toggle", kind: "machine", color: "#c0a040", icon: "⏻" },
   { id: "squeezer", label: "Squeezer", kind: "machine", color: "#6a5a40", icon: "▣" },
+  { id: "graftVat", label: "Graft Vat", kind: "machine", color: "#70a858", icon: "✚" },
   { id: "boneMelter", label: "Bone Melter", kind: "machine", color: "#c8c0b0", icon: "♨" },
+  { id: "metalMelter", label: "Metal Melter", kind: "machine", color: "#8a9aaa", icon: "♨" },
   { id: "boneMoldSword", label: "Sword Mold", kind: "machine", color: "#d0c8b8", icon: "/" },
   { id: "boneMoldSpike", label: "Spike Mold", kind: "machine", color: "#c8c0b0", icon: "▲" },
   { id: "boneMoldAxe", label: "Axe Mold", kind: "machine", color: "#b8b0a0", icon: "ᚠ" },
   { id: "boneMoldClub", label: "Club Mold", kind: "machine", color: "#a8a090", icon: "T" },
   { id: "boneReconnector", label: "Bone Join", kind: "machine", color: "#e0d8c8", icon: "⛓" },
+  { id: "boneRepairer", label: "Bone Repair", kind: "machine", color: "#d8c8a8", icon: "⊕" },
+  { id: "limbRegrower", label: "Limb Regrow", kind: "machine", color: "#88c070", icon: "↻" },
+  { id: "bodyGrower", label: "Body Grow", kind: "machine", color: "#70b888", icon: "◉" },
   { id: "crystallizer", label: "Crystallizer", kind: "machine", color: "#90d070", icon: "◆" },
   { id: "shardSmelter", label: "Shard Smelter", kind: "machine", color: "#70a0c0", icon: "♨" },
 ];
@@ -241,7 +257,7 @@ export class Game {
     this.pipeAnchor = null;
     this.userPlatforms = [];
     this.platDrag = null;
-    this.drag = { body: null, constraint: null, pointerId: null };
+    this.drag = { body: null, constraint: null, pointerId: null, samples: [] };
     this.pointerWorld = { x: 0, y: 0 };
     this.camera = { x: 0, y: 0, zoom: 1 };
     this.worldSize = { w: 2400, h: 1200 };
@@ -259,9 +275,10 @@ export class Game {
     this.engine = Engine.create({
       gravity: { x: 0, y: 1.1 },
       enableSleeping: true,
-      positionIterations: 8,
-      velocityIterations: 6,
-      constraintIterations: 4,
+      // Higher iterations + terrain resolve reduces high-speed ground tunneling
+      positionIterations: 12,
+      velocityIterations: 10,
+      constraintIterations: 6,
     });
     this.world = this.engine.world;
 
@@ -277,12 +294,18 @@ export class Game {
 
     Events.on(this.engine, "collisionStart", (e) => this._onCollisions(e));
     Events.on(this.engine, "beforeUpdate", () => {
-      // Regrow parts are static while held — no need to re-pose every physics step
       applyStandingMuscle(Composite.allBodies(this.world));
       this._updateDragConstraint();
     });
+    Events.on(this.engine, "afterUpdate", () => {
+      this._resolveTerrainPenetration();
+    });
 
-    this.runner = Runner.create();
+    // Fixed 120 Hz physics — catches fast falls that skip a 60 Hz step
+    this.runner = Runner.create({
+      isFixed: true,
+      delta: 1000 / 120,
+    });
     Runner.run(this.runner, this.engine);
 
     window.game = this;
@@ -315,14 +338,15 @@ export class Game {
     this.userPlatforms = [];
     this.platDrag = null;
     this.particles.particles = [];
-    this._endDrag();
+    this._endDrag({ applyThrow: false });
 
     const { w, h } = this.worldSize;
-    const thick = 80;
+    const thick = 160; // thick slab — thin floors are easy to tunnel through
     const groundY = this.groundY;
     const opts = {
       isStatic: true,
-      friction: 0.95,
+      friction: 0.98,
+      restitution: 0,
       render: { visible: false },
       label: "ground",
     };
@@ -354,6 +378,8 @@ export class Game {
         else if (s.kind === "vehicle") this._spawnVehicle(s.id, s.x, y);
         else if (s.kind === "machine") this._spawnMachine(s.id, s.x, y);
         else if (s.kind === "weapon") this._spawnWeapon(s.id, s.x, y);
+        else if (s.kind === "element") this._spawnElement(s.id, s.x, s.y != null ? s.y : y);
+        else if (s.kind === "syringe") this._spawnSyringe(s.id, s.x, y);
       }
     }
     this._mpStampWorld();
@@ -364,6 +390,67 @@ export class Game {
 
   _buildArena() {
     this.loadMap(this.mapId || "lab");
+  }
+
+  /**
+   * After each physics step: if a body sank into / tunneled through the ground
+   * or a platform top, seat it on the surface and kill downward speed.
+   */
+  _resolveTerrainPenetration() {
+    const gy = this.groundY;
+    const floors = [{ top: gy, minX: -400, maxX: this.worldSize.w + 400 }];
+    for (const p of this.platforms || []) {
+      floors.push({
+        top: p.bounds.min.y,
+        minX: p.bounds.min.x,
+        maxX: p.bounds.max.x,
+        bottom: p.bounds.max.y,
+      });
+    }
+    for (const p of this.userPlatforms || []) {
+      if (!p.bounds) continue;
+      floors.push({
+        top: p.bounds.min.y,
+        minX: p.bounds.min.x,
+        maxX: p.bounds.max.x,
+        bottom: p.bounds.max.y,
+      });
+    }
+
+    for (const b of Composite.allBodies(this.world)) {
+      if (b.isStatic || b.isSensor) continue;
+      if (b.label === "bullet") continue;
+      if (b.plugin?.regrowHeld || b.plugin?.frozen) continue;
+      if (b.plugin?.waterZone || b.plugin?.lavaZone || b.plugin?.acidZone) continue;
+
+      const cx = b.position.x;
+      for (const floor of floors) {
+        if (cx < floor.minX - 8 || cx > floor.maxX + 8) continue;
+        const top = floor.top;
+        const bottom = b.bounds.max.y;
+        const bodyTop = b.bounds.min.y;
+
+        // Fully below the surface (tunneled) OR sunk into the top face
+        const sunk = bottom > top + 0.5 && bodyTop < top + 48;
+        const tunneled = bodyTop >= top && (floor.bottom == null || bodyTop < floor.bottom + 4);
+
+        if (!sunk && !tunneled) continue;
+        // Don't yank bodies that are clearly under a floating platform
+        if (floor.bottom != null && b.position.y > floor.bottom + 10) continue;
+
+        const lift = top - bottom;
+        if (lift >= -0.25 && !tunneled) continue; // already seated / slight float
+
+        Body.translate(b, { x: 0, y: lift });
+        const vx = b.velocity.x * 0.9;
+        const vy = b.velocity.y > 0 ? 0 : b.velocity.y * 0.5;
+        Body.setVelocity(b, { x: vx, y: vy });
+        if (Math.abs(b.angularVelocity) > 0.4) {
+          Body.setAngularVelocity(b, b.angularVelocity * 0.5);
+        }
+        break;
+      }
+    }
   }
 
   _clientToWorld(clientX, clientY) {
@@ -402,7 +489,7 @@ export class Game {
     });
     return hits.filter((b) => {
       if (b.label === "ground" || b.label === "platform") return false;
-      if (b.plugin?.waterZone || b.plugin?.lavaZone) return false;
+      if (b.plugin?.waterZone || b.plugin?.lavaZone || b.plugin?.acidZone) return false;
       if (!b.isStatic) return true;
       return includeFrozen && !!b.plugin?.frozen;
     });
@@ -431,7 +518,7 @@ export class Game {
   }
 
   _startDrag(body, world, pointerId) {
-    this._endDrag();
+    this._endDrag({ applyThrow: false });
     if (!body || body.isStatic) return;
     const netId = ensureNetId(body);
     this._selectedNetId = netId;
@@ -439,34 +526,116 @@ export class Game {
 
     // Guests: host owns the drag constraint
     if (this.mp?.enabled && !this.mp.isHost) {
-      this.drag = { body, constraint: null, pointerId, remote: true, netId };
+      this.drag = {
+        body,
+        constraint: null,
+        pointerId,
+        remote: true,
+        netId,
+        samples: [{ x: world.x, y: world.y, t: performance.now() }],
+      };
       this.mp.sendDrag("start", { netId, x: world.x, y: world.y });
       return;
     }
 
     Body.set(body, { isSleeping: false });
+    Body.setVelocity(body, { x: 0, y: 0 });
+    Body.setAngularVelocity(body, 0);
     const dx = world.x - body.position.x;
     const dy = world.y - body.position.y;
-    const cos = Math.cos(-body.angle);
-    const sin = Math.sin(-body.angle);
+    const cos = Math.cos(body.angle);
+    const sin = Math.sin(body.angle);
+    // World → body-local (rotate by −angle)
     const constraint = Constraint.create({
       pointA: { x: world.x, y: world.y },
       bodyB: body,
       pointB: {
-        x: dx * cos - dy * sin,
-        y: dx * sin + dy * cos,
+        x: dx * cos + dy * sin,
+        y: -dx * sin + dy * cos,
       },
-      stiffness: 0.45,
-      damping: 0.08,
+      // Soft follow — stiff springs overshoot then yank back (reverse throws)
+      stiffness: 0.2,
+      damping: 0.12,
       length: 0,
       render: { visible: false },
     });
     Composite.add(this.world, constraint);
-    this.drag = { body, constraint, pointerId };
+    this.drag = {
+      body,
+      constraint,
+      pointerId,
+      netId,
+      samples: [{ x: world.x, y: world.y, t: performance.now() }],
+    };
   }
 
-  _updateDragConstraint() {
+  _sampleDragPointer(x, y) {
+    if (!this.drag?.body && !this.drag?.remote) return;
+    const t = performance.now();
+    const samples = this.drag.samples || (this.drag.samples = []);
+    const last = samples[samples.length - 1];
+    // Ignore micro-jitter / duplicate physics-style spam
+    if (last && Math.hypot(x - last.x, y - last.y) < 0.75 && t - last.t < 12) {
+      last.t = t;
+      return;
+    }
+    samples.push({ x, y, t });
+    while (samples.length > 20 || (samples.length > 2 && t - samples[0].t > 180)) {
+      samples.shift();
+    }
+  }
+
+  /**
+   * Throw from real mouse travel only.
+   * Tiny nudges + quick click-releases must not become high-speed flings
+   * (v = dx/dt explodes when dt is small).
+   */
+  _dragThrowVelocity() {
+    const samples = this.drag?.samples;
+    if (!samples || samples.length < 2) return { x: 0, y: 0 };
+
+    const newest = samples[samples.length - 1];
+    const oldest = samples[0];
+    const totalMs = newest.t - oldest.t;
+    const totalDist = Math.hypot(newest.x - oldest.x, newest.y - oldest.y);
+
+    // Click / tiny nudge / accidental release
+    if (totalDist < 28) return { x: 0, y: 0 };
+    if (totalMs < 55) return { x: 0, y: 0 };
+
+    // Velocity over ~90ms of actual travel (fall back to full span)
+    let from = oldest;
+    for (let i = samples.length - 2; i >= 0; i--) {
+      if (newest.t - samples[i].t >= 90) {
+        from = samples[i];
+        break;
+      }
+      from = samples[i];
+    }
+    const dtMs = newest.t - from.t;
+    if (dtMs < 45) return { x: 0, y: 0 };
+    const dx = newest.x - from.x;
+    const dy = newest.y - from.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 24) return { x: 0, y: 0 };
+
+    // Mouse px/s is hotter than it feels in-world — scale down
+    const GAIN = 0.38;
+    const MAX = 320;
+    let vx = (dx / (dtMs / 1000)) * GAIN;
+    let vy = (dy / (dtMs / 1000)) * GAIN;
+    const sp = Math.hypot(vx, vy);
+    if (sp > MAX) {
+      const s = MAX / sp;
+      vx *= s;
+      vy *= s;
+    }
+    return { x: vx, y: vy };
+  }
+
+  _updateDragConstraint({ sample = false } = {}) {
     if (this.drag?.remote && this.mp?.enabled) {
+      if (sample) this._sampleDragPointer(this.pointerWorld.x, this.pointerWorld.y);
       this.mp.sendDrag("move", {
         netId: this.drag.netId,
         x: this.pointerWorld.x,
@@ -475,18 +644,37 @@ export class Game {
       return;
     }
     if (!this.drag.constraint) return;
+    if (sample) this._sampleDragPointer(this.pointerWorld.x, this.pointerWorld.y);
     this.drag.constraint.pointA.x = this.pointerWorld.x;
     this.drag.constraint.pointA.y = this.pointerWorld.y;
   }
 
-  _endDrag() {
+  _endDrag({ applyThrow = true } = {}) {
+    const body = this.drag?.body;
+    const hadConstraint = !!this.drag?.constraint;
+    const throwV = applyThrow ? this._dragThrowVelocity() : { x: 0, y: 0 };
+
     if (this.drag?.remote && this.mp?.enabled) {
-      this.mp.sendDrag("end", { netId: this.drag.netId, x: this.pointerWorld.x, y: this.pointerWorld.y });
+      this.mp.sendDrag("end", {
+        netId: this.drag.netId,
+        x: this.pointerWorld.x,
+        y: this.pointerWorld.y,
+        vx: throwV.x,
+        vy: throwV.y,
+      });
     }
     if (this.drag.constraint) {
       Composite.remove(this.world, this.drag.constraint);
     }
-    this.drag = { body: null, constraint: null, pointerId: null };
+
+    // Always clear spring catch-up; only keep a throw when the swipe earned it
+    if (applyThrow && body && !body.isStatic && (hadConstraint || this.drag?.remote)) {
+      Body.set(body, { isSleeping: false });
+      Body.setVelocity(body, { x: throwV.x, y: throwV.y });
+      Body.setAngularVelocity(body, 0);
+    }
+
+    this.drag = { body: null, constraint: null, pointerId: null, samples: [] };
   }
 
   _bindUI() {
@@ -756,7 +944,7 @@ export class Game {
       spawn: this.spawnItem ? `Spawn ${this.spawnItem.label}` : "Spawn",
     };
     this.hudTool.textContent = `Tool: ${labels[id] || id}`;
-    if (id !== "drag") this._endDrag();
+    if (id !== "drag") this._endDrag({ applyThrow: false });
   }
 
   _bindInput() {
@@ -786,7 +974,7 @@ export class Game {
       const world = this._eventToWorld(e);
       this.pointerWorld = world;
       this._ctxMenuAt = performance.now();
-      this._endDrag();
+      this._endDrag({ applyThrow: false });
       if (this._longPress) {
         clearTimeout(this._longPress.timer);
         this._longPress = null;
@@ -832,7 +1020,7 @@ export class Game {
           if (!this._longPress || this._longPress.pointerId !== e.pointerId) return;
           this._openContextAt(e.clientX, e.clientY, world);
           this._longPress = null;
-          this._endDrag();
+          this._endDrag({ applyThrow: false });
         }, 480),
       };
 
@@ -949,23 +1137,27 @@ export class Game {
         return;
       }
 
-      if (this.drag.constraint) {
-        this._updateDragConstraint();
+      if (this.drag?.constraint || this.drag?.remote) {
+        this._updateDragConstraint({ sample: true });
       }
     });
 
     const endPointer = (e) => {
+      const world = this._eventToWorld(e);
+      this.pointerWorld = world;
+      if (this.drag?.body || this.drag?.remote) {
+        this._sampleDragPointer(world.x, world.y);
+      }
       if (this._longPress && this._longPress.pointerId === e.pointerId) {
         clearTimeout(this._longPress.timer);
         this._longPress = null;
       }
       if (this.platDrag && this.tool === "plat") {
-        const world = this._eventToWorld(e);
         this._finishPlatform(this.platDrag.x, this.platDrag.y, world.x, world.y);
         this.platDrag = null;
       }
       if (this.drag.pointerId == null || e.pointerId === this.drag.pointerId) {
-        this._endDrag();
+        this._endDrag({ applyThrow: true });
       }
       this._panning = false;
       this._panLast = null;
@@ -1025,7 +1217,7 @@ export class Game {
       this.mp.sendAction({ act: "clear" });
       return;
     }
-    this._endDrag();
+    this._endDrag({ applyThrow: false });
     const all = Composite.allBodies(this.world);
     const toRemove = all.filter(
       (b) => !(b.isStatic && (b.label === "ground" || b.label === "platform"))
@@ -1305,11 +1497,14 @@ export class Game {
     if (hand.plugin?.holding) releaseGrip(this.world, hand);
     if (item.plugin?.heldHand) releaseGrip(this.world, item);
 
-    const g = createGrip(hand, item, { x, y });
+    const g = createGrip(hand, item, { x, y }, this.world);
     if (!g) return;
-    Composite.add(this.world, g);
-    this.grips.push(g);
-    this.ropes.push(g);
+    const parts = Array.isArray(g) ? g : [g];
+    Composite.add(this.world, parts);
+    for (const c of parts) {
+      this.grips.push(c);
+      this.ropes.push(c);
+    }
     this.particles.burst(item.position.x, item.position.y, "#e0a060", 10, 3);
     this.particles.burst(hand.position.x, hand.position.y, "#c08040", 5, 2);
     this.gripHand = null;
@@ -1516,6 +1711,22 @@ export class Game {
     } else if (id === "metal") {
       body = Bodies.rectangle(x, y, 160, 12, { ...base, label: "prop-metal", density: 0.012, friction: 0.3 });
       body.plugin = { draw: "metal", color: "#7a8088" };
+    } else if (id === "metalRod") {
+      body = Bodies.rectangle(x, y, 110, 8, { ...base, label: "prop-metalRod", density: 0.014, friction: 0.28 });
+      body.plugin = {
+        draw: "metalRod",
+        color: "#8a949e",
+        metalStock: "rod",
+        conductive: true,
+      };
+    } else if (id === "metalPlate") {
+      body = Bodies.rectangle(x, y, 72, 42, { ...base, label: "prop-metalPlate", density: 0.016, friction: 0.4 });
+      body.plugin = {
+        draw: "metalPlate",
+        color: "#6a747e",
+        metalStock: "plate",
+        conductive: true,
+      };
     } else if (id === "weight") {
       body = Bodies.circle(x, y, 28, { ...base, label: "prop-weight", density: 0.04, friction: 0.8 });
       body.plugin = { draw: "weight", color: "#3a3e44" };
@@ -1589,6 +1800,7 @@ export class Game {
       body.plugin.flammable = true;
     }
     if (body && id === "metal") body.plugin.conductive = true;
+    if (body && (id === "metalRod" || id === "metalPlate")) body.plugin.conductive = true;
     if (body) Composite.add(this.world, body);
     return body;
   }
@@ -1612,6 +1824,14 @@ export class Game {
         render: { visible: false },
       });
       body.plugin = { draw: "lava", lavaZone: true, alwaysHot: true };
+    } else if (id === "acid") {
+      body = Bodies.rectangle(x, y, 300, 85, {
+        isStatic: true,
+        isSensor: true,
+        label: "zone-acid",
+        render: { visible: false },
+      });
+      body.plugin = { draw: "acid", acidZone: true };
     } else if (id === "torch") {
       body = Bodies.rectangle(x, y, 10, 36, { ...base, label: "el-torch", density: 0.003 });
       body.plugin = { draw: "torch", alwaysHot: true, flammable: true, burn: { t: 999, intensity: 1.1, spreadCd: 0 } };
@@ -1716,8 +1936,16 @@ export class Game {
       body = createSqueezer(x, y);
       markActivatable(body);
       this.machines.push(body);
+    } else if (id === "graftVat") {
+      body = createGraftVat(x, y);
+      markActivatable(body);
+      this.machines.push(body);
     } else if (id === "boneMelter") {
       body = createBoneMelter(x, y);
+      markActivatable(body);
+      this.machines.push(body);
+    } else if (id === "metalMelter") {
+      body = createMetalMelter(x, y);
       markActivatable(body);
       this.machines.push(body);
     } else if (BONE_MOLDS[id]) {
@@ -1728,6 +1956,18 @@ export class Game {
       }
     } else if (id === "boneReconnector") {
       body = createBoneReconnector(x, y);
+      markActivatable(body);
+      this.machines.push(body);
+    } else if (id === "boneRepairer") {
+      body = createBoneRepairer(x, y);
+      markActivatable(body);
+      this.machines.push(body);
+    } else if (id === "limbRegrower") {
+      body = createLimbRegrower(x, y);
+      markActivatable(body);
+      this.machines.push(body);
+    } else if (id === "bodyGrower") {
+      body = createBodyGrower(x, y);
       markActivatable(body);
       this.machines.push(body);
     } else if (id === "crystallizer") {
@@ -2162,7 +2402,8 @@ export class Game {
       const fruitA = bodyA.plugin?.fruit ? bodyA : null;
       const fruitB = bodyB.plugin?.fruit ? bodyB : null;
       // Impact damage — both fruits in a living–living hit; moderate falls barely hurt
-      if (fruitA && speed > 9.5) {
+      // Skip when the other body is a weapon/prop this living is holding (self-stab)
+      if (fruitA && speed > 9.5 && !isOwnedHold(bodyB, fruitA)) {
         const dmg = Math.min(42, (speed - 9) * 2.4);
         const result = damagePart(fruitA, dmg, this.particles, pair.collision.supports[0]);
         if (result === "burst") this._shake = Math.min(10, this._shake + 4);
@@ -2172,7 +2413,7 @@ export class Game {
           }
         }
       }
-      if (fruitB && speed > 9.5) {
+      if (fruitB && speed > 9.5 && !isOwnedHold(bodyA, fruitB)) {
         const dmg = Math.min(42, (speed - 9) * 2.4);
         const result = damagePart(fruitB, dmg, this.particles, pair.collision.supports[0]);
         if (result === "burst") this._shake = Math.min(10, this._shake + 4);
@@ -2190,7 +2431,12 @@ export class Game {
         (b) => b.plugin && (b.plugin.sharp || b.plugin.pierce) && b.plugin.draw !== "syringe"
       );
       const target = weapon === bodyA ? bodyB : bodyA;
-      if (weapon && target.plugin?.fruit && speed > 0.15) {
+      if (
+        weapon &&
+        target.plugin?.fruit &&
+        speed > 0.15 &&
+        !isOwnedHold(weapon, target)
+      ) {
         const now = performance.now();
         const cdOk = !weapon.plugin.hitCd || now > weapon.plugin.hitCd;
         const needsPierce = !!weapon.plugin.pierce;
@@ -2230,7 +2476,12 @@ export class Game {
           b.label !== "bullet"
       );
       const bluntTarget = blunt === bodyA ? bodyB : bodyA;
-      if (blunt && bluntTarget.plugin?.fruit && speed > 4) {
+      if (
+        blunt &&
+        bluntTarget.plugin?.fruit &&
+        speed > 4 &&
+        !isOwnedHold(blunt, bluntTarget)
+      ) {
         const now = performance.now();
         if (!blunt.plugin.hitCd || now > blunt.plugin.hitCd) {
           blunt.plugin.hitCd = now + 200;
@@ -2256,7 +2507,7 @@ export class Game {
       // Syringe: needle-first pierce with almost no force; bleed is a tiny poke
       const syringe = [bodyA, bodyB].find((b) => b.plugin?.draw === "syringe");
       const patient = syringe === bodyA ? bodyB : bodyA;
-      if (syringe && patient.plugin?.fruit) {
+      if (syringe && patient.plugin?.fruit && !isOwnedHold(syringe, patient)) {
         const pierce = checkPierce(syringe, patient, { minSpeed: 0.02, minAim: 0.18 });
         // Cooldown so one stab doesn't multi-fire
         const now = performance.now();
@@ -2653,14 +2904,29 @@ export class Game {
       if (m.plugin.squeezer) {
         tickSqueezer(m, this.world, dt, this.particles);
       }
+      if (m.plugin.graftVat) {
+        tickGraftVat(m, this.world, dt, this.particles);
+      }
       if (m.plugin.boneMelter) {
         tickBoneMelter(m, this.world, dt, this.particles);
+      }
+      if (m.plugin.metalMelter) {
+        tickMetalMelter(m, this.world, dt, this.particles);
       }
       if (m.plugin.boneMold) {
         tickBoneMold(m, this.world, dt, this.particles, (wid, x, y) => this._spawnWeapon(wid, x, y));
       }
       if (m.plugin.boneReconnector) {
         tickBoneReconnector(m, this.world, dt, this.particles, this.groundY);
+      }
+      if (m.plugin.boneRepairer) {
+        tickBoneRepairer(m, this.world, dt, this.particles);
+      }
+      if (m.plugin.limbRegrower) {
+        tickLimbRegrower(m, this.world, dt, this.particles);
+      }
+      if (m.plugin.bodyGrower) {
+        tickBodyGrower(m, this.world, dt, this.particles);
       }
       if (m.plugin.crystallizer) {
         tickCrystallizer(m, this.world, dt, this.particles, (x, y, color) => {
@@ -2743,7 +3009,7 @@ export class Game {
     const bodies = Composite.allBodies(this.world);
     // Element zones under everything
     for (const b of bodies) {
-      if (b.plugin?.waterZone || b.plugin?.lavaZone) this._drawZone(ctx, b);
+      if (b.plugin?.waterZone || b.plugin?.lavaZone || b.plugin?.acidZone) this._drawZone(ctx, b);
     }
     // Draw props/weapons first, fruit on top
     for (const b of bodies) {
@@ -2964,6 +3230,29 @@ export class Game {
       ctx.fill();
       return;
     }
+    if (this.mapTheme === "acid") {
+      const grad = ctx.createLinearGradient(0, 0, 0, groundY);
+      grad.addColorStop(0, "#3a4830");
+      grad.addColorStop(0.55, "#4a5838");
+      grad.addColorStop(1, "#2e3828");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, groundY);
+      ctx.fillStyle = "rgba(140,180,40,0.08)";
+      for (let x = 40; x < w; x += 220) {
+        ctx.beginPath();
+        ctx.ellipse(x, groundY * 0.45 + (x % 160), 90, 36, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.strokeStyle = "rgba(160,200,60,0.1)";
+      ctx.lineWidth = 1;
+      for (let x = 0; x < w; x += 80) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, groundY);
+        ctx.stroke();
+      }
+      return;
+    }
 
     // Clinical gray testing room — bake grid once
     ctx.fillStyle = "#5a5e64";
@@ -3004,6 +3293,17 @@ export class Game {
         ctx.fillStyle = x % 56 === 0 ? "#3a6a28" : "#6a9a50";
         ctx.fillRect(x, gy - 4, 10, 4);
       }
+    } else if (this.mapTheme === "acid") {
+      ctx.fillStyle = "#2a3220";
+      ctx.fillRect(-50, gy, w + 100, 220);
+      ctx.fillStyle = "#4a6030";
+      ctx.fillRect(-50, gy - 6, w + 100, 10);
+      ctx.fillStyle = "#6a9030";
+      for (let x = 0; x < w; x += 64) {
+        ctx.globalAlpha = 0.35 + ((x / 64) % 3) * 0.1;
+        ctx.fillRect(x, gy - 2, 36, 4);
+      }
+      ctx.globalAlpha = 1;
     } else if (this.mapTheme === "void") {
       ctx.fillStyle = "#12141a";
       ctx.fillRect(-50, gy, w + 100, 220);
@@ -3028,9 +3328,11 @@ export class Game {
       ctx.save();
       ctx.translate(x, y);
       ctx.rotate(p.angle);
-      ctx.fillStyle = this.mapTheme === "yard" ? "#6a5840" : "#6a6e74";
+      ctx.fillStyle =
+        this.mapTheme === "yard" ? "#6a5840" : this.mapTheme === "acid" ? "#5a6840" : "#6a6e74";
       ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
-      ctx.fillStyle = this.mapTheme === "yard" ? "#8a7355" : "#7a8088";
+      ctx.fillStyle =
+        this.mapTheme === "yard" ? "#8a7355" : this.mapTheme === "acid" ? "#7a8850" : "#7a8088";
       ctx.fillRect(-bw / 2, -bh / 2, bw, 3);
       ctx.strokeStyle = "#2a2e32";
       ctx.lineWidth = 1;
@@ -3062,6 +3364,19 @@ export class Game {
       ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
       ctx.fillStyle = "rgba(255,160,40,0.35)";
       ctx.fillRect(-bw / 2, -bh / 2, bw, bh * 0.35);
+    } else if (pl.acidZone) {
+      ctx.fillStyle = "rgba(110,160,30,0.5)";
+      ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
+      ctx.fillStyle = "rgba(180,220,60,0.28)";
+      ctx.fillRect(-bw / 2, -bh / 2, bw, bh * 0.4);
+      ctx.strokeStyle = "rgba(200,240,80,0.45)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let i = 0; i < 7; i++) {
+        const wx = -bw / 2 + (i / 6) * bw;
+        ctx.lineTo(wx, -bh / 2 + Math.sin(performance.now() / 320 + i * 1.3) * 4);
+      }
+      ctx.stroke();
     }
     ctx.restore();
   }
@@ -3247,10 +3562,47 @@ export class Game {
       ctx.fillRect(-80, -6, 160, 12);
       ctx.strokeStyle = "#3a3e44";
       ctx.strokeRect(-80, -6, 160, 12);
-      for (let i = -60; i <= 60; i += 30) {
-        ctx.fillStyle = "#9aa0a8";
-        ctx.fillRect(i - 2, -3, 4, 6);
+      ctx.fillStyle = "#9aa0a8";
+      for (let i = -60; i <= 60; i += 40) {
+        ctx.beginPath();
+        ctx.arc(i, 0, 2, 0, Math.PI * 2);
+        ctx.fill();
       }
+    } else if (pl.draw === "metalRod") {
+      ctx.fillStyle = pl.color || "#8a949e";
+      ctx.fillRect(-55, -4, 110, 8);
+      ctx.fillStyle = "#a8b0b8";
+      ctx.fillRect(-55, -4, 110, 2);
+      ctx.fillStyle = "#5a6068";
+      ctx.fillRect(-57, -5, 6, 10);
+      ctx.fillRect(51, -5, 6, 10);
+      ctx.strokeStyle = "#3a4048";
+      ctx.strokeRect(-55, -4, 110, 8);
+    } else if (pl.draw === "metalPlate") {
+      ctx.fillStyle = pl.color || "#6a747e";
+      ctx.fillRect(-36, -21, 72, 42);
+      ctx.fillStyle = "#8a949e";
+      ctx.fillRect(-36, -21, 72, 6);
+      ctx.strokeStyle = "#3a4048";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-36, -21, 72, 42);
+      ctx.fillStyle = "#9aa4ae";
+      for (const [rx, ry] of [
+        [-28, -14],
+        [28, -14],
+        [-28, 14],
+        [28, 14],
+      ]) {
+        ctx.beginPath();
+        ctx.arc(rx, ry, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-20, -8);
+      ctx.lineTo(24, 12);
+      ctx.stroke();
     } else if (pl.draw === "weight") {
       ctx.fillStyle = pl.color;
       ctx.beginPath();
@@ -3596,6 +3948,34 @@ export class Game {
         ctx.textAlign = "center";
         ctx.fillText(`${juicePercent(v)}%`, 0, 18);
       }
+    } else if (pl.draw === "graftVat") {
+      ctx.fillStyle = "#4a6840";
+      ctx.fillRect(-35, -20, 70, 48);
+      ctx.fillStyle = "#2a3a28";
+      ctx.fillRect(-28, -30, 56, 14);
+      ctx.fillStyle = pl.active ? "#90d070" : "#608050";
+      ctx.fillRect(-20, -38, 40, 12);
+      // Drip nozzle
+      ctx.fillStyle = "#c8dcc0";
+      ctx.fillRect(-4, -8, 8, 14);
+      if (pl.active) {
+        ctx.fillStyle = pl.liquid?.color || "#b8e86a";
+        ctx.globalAlpha = 0.7;
+        ctx.fillRect(-2, 4, 4, 6 + Math.sin(performance.now() / 120) * 2);
+        ctx.globalAlpha = 1;
+      }
+      const v = pl.liquid;
+      if (v) {
+        const fill = Math.max(0, Math.min(1, v.amount / v.capacity));
+        ctx.fillStyle = "rgba(0,0,0,0.4)";
+        ctx.fillRect(-30, 8, 60, 14);
+        ctx.fillStyle = v.amount > 0.5 ? v.color : "#444";
+        ctx.fillRect(-30, 8 + 14 * (1 - fill), 60, 14 * fill);
+        ctx.fillStyle = "rgba(255,255,255,0.75)";
+        ctx.font = "9px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(`${juicePercent(v)}%`, 0, 19);
+      }
     } else if (pl.draw === "boneMelter") {
       ctx.fillStyle = "#6a6558";
       ctx.fillRect(-34, -18, 68, 44);
@@ -3618,6 +3998,38 @@ export class Game {
         ctx.font = "9px sans-serif";
         ctx.textAlign = "center";
         ctx.fillText(`${juicePercent(v)}%`, 0, 15);
+      }
+    } else if (pl.draw === "metalMelter") {
+      ctx.fillStyle = "#4a5058";
+      ctx.fillRect(-36, -18, 72, 46);
+      ctx.fillStyle = pl.active ? "#e09040" : "#708090";
+      ctx.fillRect(-30, -28, 60, 12);
+      ctx.fillStyle = "#2a3038";
+      ctx.beginPath();
+      ctx.moveTo(-18, -28);
+      ctx.lineTo(0, -42);
+      ctx.lineTo(18, -28);
+      ctx.fill();
+      // Crucible rim
+      ctx.strokeStyle = "#9aa8b4";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-28, -10, 56, 18);
+      if (pl.active) {
+        const glow = 0.35 + 0.35 * Math.sin(performance.now() / 140);
+        ctx.fillStyle = `rgba(232,160,80,${glow})`;
+        ctx.fillRect(-24, -6, 48, 10);
+      }
+      const v = pl.liquid;
+      if (v) {
+        const fill = Math.max(0, Math.min(1, v.amount / v.capacity));
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fillRect(-28, 8, 56, 14);
+        ctx.fillStyle = v.amount > 0.5 ? v.color || "#c8d4e0" : "#444";
+        ctx.fillRect(-28, 8 + 14 * (1 - fill), 56, 14 * fill);
+        ctx.fillStyle = "rgba(255,255,255,0.75)";
+        ctx.font = "9px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(`${juicePercent(v)}%`, 0, 19);
       }
     } else if (
       pl.draw === "boneMoldSword" ||
@@ -3682,6 +4094,108 @@ export class Game {
         const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 200);
         ctx.strokeStyle = `rgba(232,224,208,${0.35 + pulse * 0.5})`;
         ctx.strokeRect(-36, -8, 72, 20);
+      }
+    } else if (pl.draw === "boneRepairer") {
+      ctx.fillStyle = "#5a5648";
+      ctx.fillRect(-32, -18, 64, 44);
+      ctx.fillStyle = pl.active ? "#e0d4b0" : "#9a9078";
+      ctx.fillRect(-26, -28, 52, 12);
+      // Bone cross mark
+      ctx.fillStyle = "#e8e0d0";
+      ctx.fillRect(-3, -10, 6, 22);
+      ctx.fillRect(-11, -2, 22, 6);
+      ctx.fillStyle = "#c07060";
+      ctx.fillRect(-2, -4, 4, 10);
+      const v = pl.liquid;
+      if (v) {
+        const fill = Math.max(0, Math.min(1, v.amount / v.capacity));
+        ctx.fillStyle = "rgba(0,0,0,0.4)";
+        ctx.fillRect(-26, 8, 52, 12);
+        ctx.fillStyle = v.amount > 0.5 ? v.color : "#444";
+        ctx.fillRect(-26, 8 + 12 * (1 - fill), 52, 12 * fill);
+        ctx.fillStyle = "rgba(255,255,255,0.75)";
+        ctx.font = "9px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(`${juicePercent(v)}%`, 0, 18);
+      }
+      if (pl.active && (pl.processT || 0) > 0) {
+        const pulse = 0.4 + 0.6 * Math.sin(performance.now() / 140);
+        ctx.strokeStyle = `rgba(232,224,208,${pulse})`;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(-30, -16, 60, 40);
+      }
+    } else if (pl.draw === "limbRegrower") {
+      ctx.fillStyle = "#3a5040";
+      ctx.fillRect(-43, -18, 86, 46);
+      ctx.fillStyle = pl.active ? "#90d070" : "#608050";
+      ctx.fillRect(-36, -30, 72, 14);
+      // Twin tanks: bone | juice
+      const vb = pl.liquidBone;
+      const vj = pl.liquidJuice || pl.liquid;
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(-38, 2, 34, 20);
+      ctx.fillRect(4, 2, 34, 20);
+      if (vb) {
+        const fill = Math.max(0, Math.min(1, vb.amount / vb.capacity));
+        ctx.fillStyle = vb.amount > 0.5 ? vb.color || "#d8d0c0" : "#444";
+        ctx.fillRect(-38, 2 + 20 * (1 - fill), 34, 20 * fill);
+      }
+      if (vj) {
+        const fill = Math.max(0, Math.min(1, vj.amount / vj.capacity));
+        ctx.fillStyle = vj.amount > 0.5 ? vj.color || "#b8e86a" : "#444";
+        ctx.fillRect(4, 2 + 20 * (1 - fill), 34, 20 * fill);
+      }
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.font = "8px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Bone", -21, 0);
+      ctx.fillText("Juice", 21, 0);
+      if (vb) ctx.fillText(`${juicePercent(vb)}%`, -21, 16);
+      if (vj) ctx.fillText(`${juicePercent(vj)}%`, 21, 16);
+      // Bud glyph
+      ctx.fillStyle = "#e8f0d8";
+      ctx.beginPath();
+      ctx.arc(0, -8, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillRect(-2, -4, 4, 8);
+    } else if (pl.draw === "bodyGrower") {
+      ctx.fillStyle = "#355048";
+      ctx.fillRect(-43, -18, 86, 46);
+      ctx.fillStyle = pl.active ? "#78d0a0" : "#508068";
+      ctx.fillRect(-36, -30, 72, 14);
+      const vb = pl.liquidBone;
+      const vj = pl.liquidJuice || pl.liquid;
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(-38, 2, 34, 20);
+      ctx.fillRect(4, 2, 34, 20);
+      if (vb) {
+        const fill = Math.max(0, Math.min(1, vb.amount / vb.capacity));
+        ctx.fillStyle = vb.amount > 0.5 ? vb.color || "#d8d0c0" : "#444";
+        ctx.fillRect(-38, 2 + 20 * (1 - fill), 34, 20 * fill);
+      }
+      if (vj) {
+        const fill = Math.max(0, Math.min(1, vj.amount / vj.capacity));
+        ctx.fillStyle = vj.amount > 0.5 ? vj.color || "#b8e86a" : "#444";
+        ctx.fillRect(4, 2 + 20 * (1 - fill), 34, 20 * fill);
+      }
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.font = "8px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Bone", -21, 0);
+      ctx.fillText("Juice", 21, 0);
+      if (vb) ctx.fillText(`${juicePercent(vb)}%`, -21, 16);
+      if (vj) ctx.fillText(`${juicePercent(vj)}%`, 21, 16);
+      // Head-first glyph
+      ctx.fillStyle = "#e8f8f0";
+      ctx.beginPath();
+      ctx.arc(0, -10, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillRect(-4, -4, 8, 10);
+      if (pl.growingRid) {
+        const pulse = 0.35 + 0.65 * Math.sin(performance.now() / 160);
+        ctx.strokeStyle = `rgba(168,240,200,${pulse})`;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(-40, -26, 80, 50);
       }
     } else if (pl.draw === "boneSword") {
       const col = pl.tint || pl.color || "#e8e0d0";
@@ -4083,9 +4597,15 @@ export class Game {
     if (!from) return;
     if (msg.phase === "end") {
       const c = this._remoteDragConstraints.get(from);
+      const body = c?.bodyB || this._mpFindByNetId(msg.netId);
       if (c) {
         Composite.remove(this.world, c);
         this._remoteDragConstraints.delete(from);
+      }
+      if (body && !body.isStatic && (msg.vx != null || msg.vy != null)) {
+        Body.set(body, { isSleeping: false });
+        Body.setVelocity(body, { x: msg.vx || 0, y: msg.vy || 0 });
+        Body.setAngularVelocity(body, 0);
       }
       return;
     }
@@ -4098,16 +4618,20 @@ export class Game {
     if (msg.phase === "start" || !constraint) {
       if (constraint) Composite.remove(this.world, constraint);
       Body.set(body, { isSleeping: false });
+      Body.setVelocity(body, { x: 0, y: 0 });
       const dx = msg.x - body.position.x;
       const dy = msg.y - body.position.y;
-      const cos = Math.cos(-body.angle);
-      const sin = Math.sin(-body.angle);
+      const cos = Math.cos(body.angle);
+      const sin = Math.sin(body.angle);
       constraint = Constraint.create({
         pointA: { x: msg.x, y: msg.y },
         bodyB: body,
-        pointB: { x: dx * cos - dy * sin, y: dx * sin + dy * cos },
-        stiffness: 0.45,
-        damping: 0.08,
+        pointB: {
+          x: dx * cos + dy * sin,
+          y: -dx * sin + dy * cos,
+        },
+        stiffness: 0.2,
+        damping: 0.12,
         length: 0,
         render: { visible: false },
       });

@@ -33,12 +33,17 @@ export function isActivatable(body) {
     d === "grenade" ||
     d === "crossbow" ||
     d === "squeezer" ||
+    d === "graftVat" ||
     d === "boneMelter" ||
+    d === "metalMelter" ||
     d === "boneMoldSword" ||
     d === "boneMoldSpike" ||
     d === "boneMoldAxe" ||
     d === "boneMoldClub" ||
     d === "boneReconnector" ||
+    d === "boneRepairer" ||
+    d === "limbRegrower" ||
+    d === "bodyGrower" ||
     d === "crystallizer" ||
     d === "shardSmelter"
   );

@@ -18,10 +18,10 @@ export function serializeScene(game) {
 
   for (const b of bodies) {
     if (b.isStatic && (b.label === "ground" || b.label === "platform")) continue;
-    if (b.plugin?.waterZone || b.plugin?.lavaZone) {
+    if (b.plugin?.waterZone || b.plugin?.lavaZone || b.plugin?.acidZone) {
       items.push({
         kind: "element",
-        id: b.plugin.waterZone ? "water" : "lava",
+        id: b.plugin.waterZone ? "water" : b.plugin.lavaZone ? "lava" : "acid",
         x: b.position.x,
         y: b.position.y,
       });
@@ -113,6 +113,16 @@ export function serializeScene(game) {
               type: b.plugin.liquid.type,
               color: b.plugin.liquid.color,
               fromShard: !!b.plugin.liquid.fromShard,
+              fruitMix: b.plugin.liquid.fruitMix || null,
+            }
+          : null,
+        liquidBone: b.plugin.liquidBone
+          ? {
+              amount: b.plugin.liquidBone.amount,
+              capacity: b.plugin.liquidBone.capacity,
+              type: b.plugin.liquidBone.type,
+              color: b.plugin.liquidBone.color,
+              fromShard: !!b.plugin.liquidBone.fromShard,
             }
           : null,
         color: b.plugin.color || null,
@@ -182,12 +192,17 @@ function kindFromBody(b) {
       "button",
       "toggle",
       "squeezer",
+      "graftVat",
       "boneMelter",
+      "metalMelter",
       "boneMoldSword",
       "boneMoldSpike",
       "boneMoldAxe",
       "boneMoldClub",
       "boneReconnector",
+      "boneRepairer",
+      "limbRegrower",
+      "bodyGrower",
       "crystallizer",
       "shardSmelter",
     ].includes(d)
@@ -221,9 +236,10 @@ function kindFromBody(b) {
   if (d === "cloth") return "cloth";
   if (d === "juiceShard") return "prop";
   if (
-    ["water", "lava", "torch", "firebarrel", "watercan", "battery", "wire", "shockpad"].includes(d) ||
+    ["water", "lava", "acid", "torch", "firebarrel", "watercan", "battery", "wire", "shockpad"].includes(d) ||
     b.plugin?.waterZone ||
-    b.plugin?.lavaZone
+    b.plugin?.lavaZone ||
+    b.plugin?.acidZone
   )
     return "element";
   return "prop";
@@ -237,6 +253,8 @@ function spawnIdFromDraw(b) {
     crate: "crate",
     plank: "plank",
     metal: "metal",
+    metalRod: "metalRod",
+    metalPlate: "metalPlate",
     weight: "weight",
     barrel: "barrel",
     tank: "tank",
@@ -262,12 +280,17 @@ function spawnIdFromDraw(b) {
     button: "button",
     toggle: "toggle",
     squeezer: "squeezer",
+    graftVat: "graftVat",
     boneMelter: "boneMelter",
+    metalMelter: "metalMelter",
     boneMoldSword: "boneMoldSword",
     boneMoldSpike: "boneMoldSpike",
     boneMoldAxe: "boneMoldAxe",
     boneMoldClub: "boneMoldClub",
     boneReconnector: "boneReconnector",
+    boneRepairer: "boneRepairer",
+    limbRegrower: "limbRegrower",
+    bodyGrower: "bodyGrower",
     crystallizer: "crystallizer",
     shardSmelter: "shardSmelter",
     juiceShard: "juiceShard",
@@ -369,6 +392,16 @@ export function deserializeScene(game, data) {
       Body.setAngle(body, item.angle || 0);
       if (item.liquid && body.plugin?.liquid) {
         Object.assign(body.plugin.liquid, item.liquid);
+      }
+      if (item.liquidBone && body.plugin?.liquidBone) {
+        Object.assign(body.plugin.liquidBone, item.liquidBone);
+      }
+      if (
+        (body.plugin?.limbRegrower || body.plugin?.bodyGrower) &&
+        body.plugin.liquid &&
+        body.plugin.liquidJuice !== body.plugin.liquid
+      ) {
+        body.plugin.liquidJuice = body.plugin.liquid;
       }
       if (item.color && body.plugin) body.plugin.color = item.color;
       if (item.tint && body.plugin) {

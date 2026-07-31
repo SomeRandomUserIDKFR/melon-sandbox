@@ -160,6 +160,7 @@ export function tickShardSmelter(smelter, world, dt, particles) {
 export function moldMeltReady(vessel, cost) {
   if (!vessel || vessel.amount < cost) return false;
   if (vessel.type === BONE_MELT_TYPE_ALIAS) return true;
+  if (vessel.type === "metalBoneMelt" || vessel.type === "liquidMetal") return true;
   if (vessel.type === CRYSTAL_MELT_TYPE || vessel.type === HYBRID_MELT_TYPE) {
     return !!vessel.fromShard;
   }
@@ -169,6 +170,7 @@ export function moldMeltReady(vessel, cost) {
 /**
  * Decide cast result from mold melt:
  * - boneMelt → bone weapon (ivory)
+ * - metalBoneMelt / liquidMetal → steel-tinted bone weapon
  * - crystalMelt → crystal-tinted bone-shaped weapon
  * - hybridMelt → bone weapon tinted with melt color
  */
@@ -179,6 +181,9 @@ export function moldCastStyle(vessel) {
   }
   if (vessel?.type === HYBRID_MELT_TYPE) {
     return { tint: color, crystal: false, hybrid: true };
+  }
+  if (vessel?.type === "metalBoneMelt" || vessel?.type === "liquidMetal") {
+    return { tint: color || (vessel?.type === "liquidMetal" ? "#c8d4e0" : "#8a9aaa"), crystal: false, hybrid: false };
   }
   return { tint: null, crystal: false, hybrid: false };
 }

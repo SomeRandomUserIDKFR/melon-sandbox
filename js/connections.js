@@ -176,28 +176,73 @@ export function isGrabbable(body) {
   if (!body || body.isStatic) return false;
   if (body.plugin?.fruit) return false;
   if (body.label === "ground" || body.label === "platform") return false;
-  if (body.plugin?.waterZone || body.plugin?.lavaZone) return false;
+  if (body.plugin?.waterZone || body.plugin?.lavaZone || body.plugin?.acidZone) return false;
   if (body.plugin?.vehiclePart === "wheel") return false;
   return true;
 }
 
-/**
- * Snap item into the palm and pin with a stiff zero-length grip.
- * Joins the living's collision group so the item doesn't fight the arms.
- */
-export function createGrip(hand, item, worldPoint = null) {
-  if (!hand || !item) return null;
+/** True when `item` is gripped by the same living as `livingPart`. */
+export function isOwnedHold(item, livingPart) {
+  const rid = livingPart?.plugin?.ragdollId;
+  if (!rid || !item?.plugin) return false;
+  if (item.plugin.heldBy === rid) return true;
+  if (item.plugin.heldHand?.plugin?.ragdollId === rid) return true;
+  return false;
+}
 
-  // Drop prior holds on this hand / this item
-  // (caller usually does this; safe no-op if already free)
+/**
+ * Local grab point on an item — prefer the handle, never the blade tip.
+ * tipAxis -1 = tip on local −Y (swords); +1 = tip on +Y (syringes).
+ */
+export function itemGripLocal(item) {
+  const pl = item?.plugin;
+  if (!pl) return { x: 0, y: 0 };
+  const tipLen = pl.tipLength ?? 28;
+  if (pl.tipAxis === -1 || ((pl.sharp || pl.pierce) && pl.tipAxis == null)) {
+    return { x: 0, y: tipLen * 0.55 };
+  }
+  if (pl.tipAxis === 1 || pl.draw === "syringe") {
+    return { x: 0, y: -Math.max(8, tipLen * 0.35) };
+  }
+  if (pl.firearm) return { x: 0, y: 12 };
+  if (pl.draw === "hammer" || pl.draw === "baton" || pl.draw === "boneClub") {
+    return { x: 0, y: 14 };
+  }
+  return { x: 0, y: 0 };
+}
+
+/** Point the item's tip along the hand's outward (+Y) direction. */
+function orientHeldItem(hand, item) {
+  const pl = item?.plugin;
+  if (!pl) return;
+  const tipAxis = pl.tipAxis ?? ((pl.sharp || pl.pierce) ? -1 : 0);
+  if (!tipAxis && !pl.firearm && pl.draw !== "syringe") return;
+  // Hand distal direction in world (local +Y)
+  const c = Math.cos(hand.angle);
+  const s = Math.sin(hand.angle);
+  const fwdAng = Math.atan2(c, -s); // angle of local +Y
+  // tipAxis -1 → tip is local −Y → item angle = fwdAng + π
+  // tipAxis +1 → tip is local +Y → item angle = fwdAng
+  const ang = tipAxis >= 0 ? fwdAng : fwdAng + Math.PI;
+  Body.setAngle(item, ang);
+}
+
+/**
+ * Snap item into the palm by the handle and pin with a stiff grip.
+ * Matches the living's non-colliding group so the weapon can't jab its owner.
+ */
+export function createGrip(hand, item, _worldPoint = null, world = null) {
+  if (!hand || !item) return null;
 
   const tip = handTipLocal(hand);
   const tipW = localToWorld(hand, tip.x, tip.y);
-  const itemLocal = worldPoint
-    ? worldToLocal(item, worldPoint.x, worldPoint.y)
-    : { x: 0, y: 0 };
 
-  // Snap grab point onto the palm tip
+  if (!item.plugin) item.plugin = {};
+
+  // Always grip the handle — click-on-blade was stabbing the holder
+  orientHeldItem(hand, item);
+  const itemLocal = itemGripLocal(item);
+
   const cur = localToWorld(item, itemLocal.x, itemLocal.y);
   Body.set(item, { isSleeping: false });
   Body.set(hand, { isSleeping: false });
@@ -209,14 +254,34 @@ export function createGrip(hand, item, worldPoint = null) {
     x: hand.velocity.x,
     y: hand.velocity.y,
   });
-  Body.setAngularVelocity(item, hand.angularVelocity * 0.4);
+  Body.setAngularVelocity(item, 0);
 
-  if (!item.plugin) item.plugin = {};
-  // Match living collision group so held props don't explode out of the hand
+  // Prefer plugin collisionGroup (survives category tweaks; filter.group can be 0)
+  let group = hand.plugin?.collisionGroup || hand.collisionFilter?.group || 0;
+  if (!group && world && hand.plugin?.ragdollId) {
+    const sib = Composite.allBodies(world).find(
+      (b) =>
+        b.plugin?.ragdollId === hand.plugin.ragdollId &&
+        (b.plugin.collisionGroup || b.collisionFilter?.group)
+    );
+    group = sib?.plugin?.collisionGroup || sib?.collisionFilter?.group || 0;
+  }
+  if (!group) {
+    group = Body.nextGroup(true);
+    if (world && hand.plugin?.ragdollId) {
+      for (const b of Composite.allBodies(world)) {
+        if (b.plugin?.ragdollId !== hand.plugin.ragdollId) continue;
+        b.plugin.collisionGroup = group;
+        b.collisionFilter = { ...b.collisionFilter, group };
+      }
+    } else {
+      hand.plugin.collisionGroup = group;
+      hand.collisionFilter = { ...hand.collisionFilter, group };
+    }
+  }
   if (item.plugin._gripPrevGroup == null) {
     item.plugin._gripPrevGroup = item.collisionFilter?.group ?? 0;
   }
-  const group = hand.collisionFilter?.group ?? hand.plugin?.collisionGroup ?? 0;
   item.collisionFilter = {
     ...item.collisionFilter,
     group,
@@ -227,8 +292,8 @@ export function createGrip(hand, item, worldPoint = null) {
     bodyB: item,
     pointA: tip,
     pointB: itemLocal,
-    stiffness: 0.95,
-    damping: 0.2,
+    stiffness: 0.88,
+    damping: 0.28,
     length: 0,
     render: { visible: false },
   });
@@ -239,10 +304,41 @@ export function createGrip(hand, item, worldPoint = null) {
     isGrip: true,
   };
 
+  // Keep tip pointed out with a second soft pin along the handle
+  let align = null;
+  const tipAx = item.plugin.tipAxis ?? ((item.plugin.sharp || item.plugin.pierce) ? -1 : 0);
+  if (tipAx || item.plugin.firearm || item.plugin.draw === "syringe") {
+    const towardTip = tipAx >= 0 ? 10 : -10;
+    const alignLocal = { x: itemLocal.x, y: itemLocal.y + towardTip };
+    const alignHand = { x: tip.x * 0.25, y: tip.y + 2 };
+    align = Constraint.create({
+      bodyA: hand,
+      bodyB: item,
+      pointA: alignHand,
+      pointB: alignLocal,
+      stiffness: 0.55,
+      damping: 0.22,
+      length: 0,
+      render: { visible: false },
+    });
+    align.plugin = {
+      draw: "grip",
+      linkType: "grip",
+      color: "#e0a060",
+      isGrip: true,
+      gripAlign: true,
+    };
+  }
+
   item.plugin.heldBy = hand.plugin?.ragdollId || null;
   item.plugin.heldHand = hand;
   if (!hand.plugin) hand.plugin = {};
   hand.plugin.holding = item;
+
+  if (align) {
+    c.plugin.alignConstraint = align;
+    return [c, align];
+  }
   return c;
 }
 

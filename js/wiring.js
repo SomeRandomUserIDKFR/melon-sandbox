@@ -36,7 +36,7 @@ export function tickSensors(bodies, dt, particles = null) {
       const range = pl.sensorRange || 90;
       for (const other of bodies) {
         if (other === b || other.isStatic) continue;
-        if (other.plugin?.waterZone || other.plugin?.lavaZone) continue;
+        if (other.plugin?.waterZone || other.plugin?.lavaZone || other.plugin?.acidZone) continue;
         const d = Math.hypot(other.position.x - b.position.x, other.position.y - b.position.y);
         if (d < range) {
           pl.sensorTripped = true;

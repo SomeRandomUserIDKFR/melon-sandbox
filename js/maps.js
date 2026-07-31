@@ -262,6 +262,70 @@ export const MAPS = {
 
   },
 
+  acidPool: {
+
+    id: "acidPool",
+
+    label: "Acid Pool",
+
+    size: { w: 3000, h: 1200 },
+
+    theme: "acid",
+
+    groundY: 1100,
+
+    platforms: [
+
+      { x: 180, y: 1020, w: 300, h: 18 },
+
+      { x: 620, y: 900, w: 160, h: 16 },
+
+      { x: 980, y: 820, w: 180, h: 16 },
+
+      { x: 1400, y: 900, w: 220, h: 16 },
+
+      { x: 1850, y: 780, w: 180, h: 16 },
+
+      { x: 2300, y: 920, w: 200, h: 16 },
+
+      { x: 2750, y: 1000, w: 280, h: 18 },
+
+      { x: 800, y: 1040, w: 90, h: 14 },
+
+      { x: 1600, y: 1030, w: 90, h: 14 },
+
+      { x: 2100, y: 1040, w: 90, h: 14 },
+
+    ],
+
+    spawn: [
+
+      { kind: "fruit", id: "cactus", x: 140 },
+
+      { kind: "fruit", id: "melon", x: 240 },
+
+      { kind: "fruit", id: "lemon", x: 2780 },
+
+      { kind: "element", id: "acid", x: 520, y: 1060 },
+
+      { kind: "element", id: "acid", x: 1100, y: 1060 },
+
+      { kind: "element", id: "acid", x: 1680, y: 1060 },
+
+      { kind: "element", id: "acid", x: 2150, y: 1060 },
+
+      { kind: "element", id: "acid", x: 2500, y: 1060 },
+
+      { kind: "prop", id: "plank", x: 640, yOff: -16 },
+
+      { kind: "prop", id: "box", x: 2720, yOff: -28 },
+
+      { kind: "prop", id: "barrel", x: 200, yOff: -30 },
+
+    ],
+
+  },
+
 };
 
 

@@ -113,18 +113,51 @@ export function boneMaxHp(part) {
   return BONE_HP[part] ?? Math.round(fleshMaxHp(part) * 2.5);
 }
 
+/** Metal frames (robots / metal-bone melt) use this multiplier on bone HP. */
+export const METAL_BONE_MUL = 3;
+
+/** True when this part’s frame is metal (even under normal fruit flesh). */
+export function isMetalFrame(pl) {
+  if (!pl) return false;
+  if (pl.boneKind === "metal") return true;
+  if (pl.boneKind === "bone") return false;
+  return !!pl.fruit?.metal;
+}
+
+export function frameBoneMul(pl) {
+  if (pl?.boneHpMul != null) return pl.boneHpMul;
+  return isMetalFrame(pl) ? METAL_BONE_MUL : 1;
+}
+
+export function effectiveBoneMaxHp(part, pl) {
+  return boneMaxHp(part) * frameBoneMul(pl);
+}
+
+/** Mark / clear metal skeletal frame (flesh species stays independent). */
+export function setMetalFrame(pl, on = true) {
+  if (!pl) return;
+  if (on) {
+    pl.boneKind = "metal";
+    pl.boneHpMul = METAL_BONE_MUL;
+  } else {
+    pl.boneKind = "bone";
+    if (pl.boneHpMul === METAL_BONE_MUL) pl.boneHpMul = null;
+  }
+}
+
 /** Put a fleshed part into skeleton state with full bone HP. */
 export function stripToBone(body, particles) {
   const pl = body?.plugin;
   if (!pl?.fruit || pl.state === "skeleton" || pl.state === "gone") return false;
   pl.fleshMaxHp = pl.fleshMaxHp || pl.maxHp || fleshMaxHp(pl.part);
   pl.state = "skeleton";
-  pl.maxHp = boneMaxHp(pl.part);
+  pl.maxHp = effectiveBoneMaxHp(pl.part, pl);
   pl.hp = pl.maxHp;
   pl.boneBroken = true;
   pl.conscious = false;
   Body.set(body, { density: Math.max(0.0004, body.density * 0.55) });
-  particles?.burst?.(body.position.x, body.position.y, "#c8c2b4", 6, 3);
+  const spark = isMetalFrame(pl) ? "#9ab0c0" : "#c8c2b4";
+  particles?.burst?.(body.position.x, body.position.y, spark, 6, 3);
   return true;
 }
 
@@ -152,6 +185,8 @@ function partOpts(fruit, part, extras = {}) {
       jointSprain: false,
       detached: false,
       conscious: true,
+      boneKind: fruit?.metal ? "metal" : "bone",
+      boneHpMul: fruit?.metal ? METAL_BONE_MUL : null,
       ai: { mode: "idle", dir: 1, timer: 0, phase: 0, punchCd: 0 },
       lostJoints: [],
     },
@@ -385,19 +420,19 @@ export function damagePart(body, amount, particles, at = null, opts = {}) {
     const overflow = Math.max(0, -pl.hp);
     pl.state = "skeleton";
     pl.fleshMaxHp = pl.fleshMaxHp || pl.maxHp || fleshMaxHp(pl.part);
-    const mul = pl.boneHpMul != null ? pl.boneHpMul : 1;
-    pl.maxHp = boneMaxHp(pl.part) * mul;
+    pl.maxHp = effectiveBoneMaxHp(pl.part, pl);
     pl.hp = Math.max(0, pl.maxHp - overflow);
     pl.boneBroken = true;
     pl.conscious = false;
     particles.burst(cx, cy, juice, 28, 8);
     particles.burst(cx, cy, juiceDark, 12, 5);
-    Body.set(body, { density: body.density * 0.55 });
+    const spark = isMetalFrame(pl) ? "#9ab0c0" : "#c8c2b4";
     if (pl.hp <= 0) {
       pl.state = "gone";
-      particles.burst(cx, cy, "#c8c2b4", 8, 4);
+      particles.burst(cx, cy, spark, 8, 4);
       return "shatter";
     }
+    Body.set(body, { density: body.density * 0.55 });
     return "burst";
   }
 
@@ -405,7 +440,7 @@ export function damagePart(body, amount, particles, at = null, opts = {}) {
   if (pl.state === "skeleton" && pl.hp <= 0) {
     pl.state = "gone";
     pl.conscious = false;
-    particles.burst(cx, cy, "#c8c2b4", 8, 4);
+    particles.burst(cx, cy, isMetalFrame(pl) ? "#9ab0c0" : "#c8c2b4", 8, 4);
     return "shatter";
   }
 
@@ -643,7 +678,22 @@ export function restoreSkin(parts, { clearBruises = true, full = false } = {}) {
 export function getConnectedCluster(world, seed) {
   if (!seed?.plugin?.ragdollId) return [];
   const rid = seed.plugin.ragdollId;
-  const bodies = Composite.allBodies(world).filter((b) => b.plugin?.ragdollId === rid);
+  const bodies = Composite.allBodies(world).filter(
+    (b) => b.plugin?.ragdollId === rid && b.plugin.state !== "gone"
+  );
+  // Regrow intentionally strips joints and poses kinematically.
+  // Treat the whole living as one cluster so mid-regrow limbs aren't
+  // mistaken for severed stumps (which forks them into flying corpses).
+  const regenerating = bodies.some(
+    (b) =>
+      b.plugin?.effects?.regrow ||
+      b.plugin?.effects?.machineRegrow ||
+      b.plugin?.regrowHeld ||
+      b.plugin?.growing ||
+      b.plugin?.effects?.passiveStrong
+  );
+  if (regenerating) return bodies;
+
   const cons = Composite.allConstraints(world).filter(
     (c) => c.plugin?.isFruitJoint && c.plugin.ragdollId === rid
   );
@@ -838,12 +888,21 @@ export function regrowMissingPart(world, parts, slot) {
   body.plugin.collisionGroup = group;
   body.collisionFilter = { ...body.collisionFilter, group };
   body.plugin.blueprint = pl0.blueprint || [];
+  // Inherit skeletal frame (metal vs bone) from the living — independent of flesh juice
+  if (pl0.boneKind === "metal" || pl0.boneHpMul === METAL_BONE_MUL || fruit?.metal) {
+    setMetalFrame(body.plugin, true);
+  } else {
+    body.plugin.boneKind = pl0.boneKind || "bone";
+    body.plugin.boneHpMul = pl0.boneHpMul ?? null;
+  }
   body.plugin.state = "damaged";
   body.plugin.hp = body.plugin.maxHp * 0.25;
   body.plugin.conscious = true;
   body.plugin.bruises = 0.2;
   body.plugin.detached = false;
   body.plugin.isLiving = true;
+  if (pl0.forkedFrom) body.plugin.forkedFrom = pl0.forkedFrom;
+  if (pl0.regrowPoseX != null) body.plugin.regrowPoseX = pl0.regrowPoseX;
   const vessel = parts.find((p) => p.plugin?.liquid)?.plugin.liquid;
   if (vessel) body.plugin.liquid = vessel;
 
@@ -853,15 +912,21 @@ export function regrowMissingPart(world, parts, slot) {
   // Torso always grows world-upright so a severed stump rebuilds a real body.
   if (slot === "torso") {
     Body.setAngle(body, 0);
-    // Put torso near the stump, upright; snap stump onto the torso socket
-    Body.setPosition(body, { x: parent.position.x, y: parent.position.y });
+    // Prefer the locked stump X so we don't grow inside the original host
+    const preferX =
+      pl0.regrowPoseX != null
+        ? pl0.regrowPoseX
+        : parent.plugin?.regrowPoseX != null
+          ? parent.plugin.regrowPoseX
+          : parent.position.x;
+    body.plugin.regrowPoseX = preferX;
+    Body.setPosition(body, { x: preferX, y: parent.position.y });
     const torsoLocal = childLocal; // socket on torso that meets the stump
     const stumpLocal = { x: attach.localX || 0, y: attach.localY || 0 };
-    // World point: keep stump where it is; move torso so its socket hits stump socket
     const stumpWorld = localToWorld(parent, stumpLocal.x, stumpLocal.y);
+    // Keep stump X; only match Y socket, then snap X to preferred pose
     placeLocalOnWorld(body, torsoLocal, stumpWorld.x, stumpWorld.y);
-    // Record inverted grow parenting: we still hold CHILD (torso) to PARENT (stump)
-    // each frame using these locals — but force torso angle 0 while growing.
+    Body.setPosition(body, { x: preferX, y: body.position.y });
     body.plugin.growForceUpright = true;
   } else {
     Body.setAngle(body, preferredRegrowAngle(parent, slot));
@@ -1144,6 +1209,8 @@ function easeOutCubic(t) {
 /**
  * Pin regenerating parts as static so the Matter runner can't collapse them
  * into a pile between game ticks (same-ragdoll parts don't collide).
+ * Also disable collisions with other livings while held — overlapping host +
+ * stump regrows were exploding when released.
  */
 export function setRegrowHeld(parts, held) {
   for (const p of parts) {
@@ -1152,6 +1219,20 @@ export function setRegrowHeld(parts, held) {
     if (held) {
       if (!p.plugin.regrowHeld) {
         p.plugin.regrowHeld = true;
+        if (!p.plugin._preRegrowCollision) {
+          p.plugin._preRegrowCollision = {
+            category: p.collisionFilter?.category ?? 0x0001,
+            mask: p.collisionFilter?.mask ?? 0xffffffff,
+            group: p.collisionFilter?.group ?? 0,
+          };
+        }
+        // Only collide with default static world (ground/platforms), not other livings
+        p.collisionFilter = {
+          ...p.collisionFilter,
+          group: p.plugin.collisionGroup || p.collisionFilter.group || 0,
+          category: 0x0004,
+          mask: 0x0001,
+        };
         Body.setStatic(p, true);
       }
       Body.setVelocity(p, { x: 0, y: 0 });
@@ -1159,9 +1240,52 @@ export function setRegrowHeld(parts, held) {
     } else if (p.plugin.regrowHeld) {
       p.plugin.regrowHeld = false;
       Body.setStatic(p, false);
+      const prev = p.plugin._preRegrowCollision;
+      if (prev) {
+        p.collisionFilter = {
+          ...p.collisionFilter,
+          category: prev.category,
+          mask: prev.mask,
+          group: prev.group,
+        };
+        p.plugin._preRegrowCollision = null;
+      } else {
+        p.collisionFilter = {
+          ...p.collisionFilter,
+          category: 0x0001,
+          mask: 0xffffffff,
+          group: p.plugin.collisionGroup || 0,
+        };
+      }
       Body.setVelocity(p, { x: 0, y: 0 });
       Body.setAngularVelocity(p, 0);
+      Body.set(p, { restitution: 0.02, frictionAir: 0.08 });
     }
+  }
+}
+
+/**
+ * Nudge a stump/cluster away from its original host so both can regrow
+ * without occupying the same standing footprint.
+ */
+export function nudgeClusterAwayFromRid(world, cluster, otherRid, minDist = 100) {
+  if (!otherRid || !cluster?.length) return;
+  const others = Composite.allBodies(world).filter(
+    (b) => b.plugin?.ragdollId === otherRid && b.plugin.state !== "gone"
+  );
+  if (!others.length) return;
+
+  const hx = others.reduce((s, b) => s + b.position.x, 0) / others.length;
+  const cx = cluster.reduce((s, b) => s + b.position.x, 0) / cluster.length;
+  let dx = cx - hx;
+  if (Math.abs(dx) < 12) dx = cx >= hx ? 1 : -1;
+  const dist = Math.abs(cx - hx);
+  if (dist >= minDist) return;
+  const push = (minDist - dist) * Math.sign(dx);
+  for (const p of cluster) {
+    Body.setPosition(p, { x: p.position.x + push, y: p.position.y });
+    Body.setVelocity(p, { x: 0, y: 0 });
+    Body.setAngularVelocity(p, 0);
   }
 }
 
@@ -1182,7 +1306,9 @@ export function tickGrowingParts(world, bodies, dt, particles, groundY = null) {
 
   for (const [rid, parts] of byRid) {
     const regenerating =
-      parts.some((p) => p.plugin?.growing) || parts.some((p) => p.plugin?.effects?.regrow);
+      parts.some((p) => p.plugin?.growing) ||
+      parts.some((p) => p.plugin?.effects?.regrow) ||
+      parts.some((p) => p.plugin?.effects?.machineRegrow);
     if (!regenerating) continue;
 
     // Drop live fruit joints while posing — they fight kinematic seating and explode
@@ -1195,7 +1321,15 @@ export function tickGrowingParts(world, bodies, dt, particles, groundY = null) {
 
     const torso = parts.find((p) => p.plugin.partSlot === "torso");
     if (torso) {
-      poseStandingCluster(parts, torso, groundY);
+      // Inherit locked X from any stump part
+      if (torso.plugin.regrowPoseX == null) {
+        const locked = parts.find((p) => p.plugin?.regrowPoseX != null);
+        if (locked) torso.plugin.regrowPoseX = locked.plugin.regrowPoseX;
+      }
+      // Machine regrow stands on the vat bed; syringe uses world ground
+      const floorY =
+        torso.plugin.regrowGroundY != null ? torso.plugin.regrowGroundY : groundY;
+      poseStandingCluster(parts, torso, floorY);
     } else {
       // Stump only — keep it calm until torso buds
       for (const p of parts) {
@@ -1216,10 +1350,19 @@ export function tickGrowingParts(world, bodies, dt, particles, groundY = null) {
       pl.scale = pl.baseScale || 1;
       pl.hp = pl.maxHp * (0.25 + 0.75 * eased);
       pl.bruises = Math.max(0, 0.28 * (1 - eased));
-      if (eased > 0.4) pl.state = "alive";
+      if (eased > 0.4 && !pl.forgeSkeleton) pl.state = "alive";
+      if (pl.forgeSkeleton && eased > 0.15) {
+        // Stay bone-looking while budding without juice coat
+        pl.state = "skeleton";
+      }
 
       if (particles && Math.random() < 0.05) {
-        particles.drip(b.position.x, b.position.y, "#70d0ff", 1);
+        particles.drip(
+          b.position.x,
+          b.position.y,
+          pl.forgeSkeleton ? (isMetalFrame(pl) ? "#9ab0c0" : "#c8c2b4") : "#70d0ff",
+          1
+        );
       }
 
       if (progress >= 1) {
@@ -1236,7 +1379,8 @@ export function tickGrowingParts(world, bodies, dt, particles, groundY = null) {
  */
 export function poseStandingCluster(parts, torso, groundY = null) {
   const s = torso.plugin.scale || torso.plugin.baseScale || 1;
-  const tx = torso.position.x;
+  // Optional lateral offset so a stump-grown body doesn't spawn inside the host
+  const tx = (torso.plugin.regrowPoseX != null ? torso.plugin.regrowPoseX : torso.position.x);
   const [tw, th] = PART_SIZE.torso.map((v) => v * s);
   const [, ulh] = PART_SIZE.upperLeg.map((v) => v * s);
   const [, llh] = PART_SIZE.lowerLeg.map((v) => v * s);
@@ -1300,11 +1444,19 @@ function finishLimbGrowth(world, body, particles) {
   pl.growMul = 1;
   pl.physicsMul = 1;
   pl.scale = pl.baseScale || 1;
-  pl.hp = pl.maxHp;
   pl.bruises = 0;
-  pl.state = "alive";
   pl.boneBroken = false;
   pl.jointSprain = false;
+  if (pl.forgeSkeleton) {
+    pl.fleshMaxHp = pl.fleshMaxHp || pl.maxHp;
+    pl.state = "skeleton";
+    pl.maxHp = effectiveBoneMaxHp(pl.part, pl);
+    pl.hp = pl.maxHp;
+    pl.forgeSkeleton = false;
+  } else {
+    pl.state = "alive";
+    pl.hp = pl.maxHp;
+  }
   pl.growing = null;
   pl.growAbout = null;
   pl.growAboutFull = null;
@@ -1340,6 +1492,105 @@ export const REGROW_ORDER = [
   "rf",
 ];
 
+/** Head-first order for forming a brand-new living (Body Grower). */
+export const BODY_GROW_ORDER = [
+  "head",
+  "torso",
+  "lua",
+  "rua",
+  "lla",
+  "rla",
+  "lul",
+  "rul",
+  "lll",
+  "rll",
+  "lf",
+  "rf",
+];
+
+/** Joint recipe for a full Melon living at the given scale (no live constraints). */
+function standardBlueprint(s = 1) {
+  const headR = PART_SIZE.headR * s;
+  const [tw, th] = PART_SIZE.torso.map((v) => v * s);
+  const [, uah] = PART_SIZE.upperArm.map((v) => v * s);
+  const [, lah] = PART_SIZE.lowerArm.map((v) => v * s);
+  const [, ulh] = PART_SIZE.upperLeg.map((v) => v * s);
+  const [, llh] = PART_SIZE.lowerLeg.map((v) => v * s);
+  const [, fh] = PART_SIZE.foot.map((v) => v * s);
+  const legX = 7 * s;
+  return [
+    { slotA: "head", slotB: "torso", ax: 0, ay: headR * 0.85, bx: 0, by: -th / 2, stiffness: 0.95, damping: 0.18 },
+    { slotA: "torso", slotB: "lua", ax: -tw / 2, ay: -th * 0.28, bx: 0, by: -uah / 2, stiffness: 0.88, damping: 0.14 },
+    { slotA: "torso", slotB: "rua", ax: tw / 2, ay: -th * 0.28, bx: 0, by: -uah / 2, stiffness: 0.88, damping: 0.14 },
+    { slotA: "lua", slotB: "lla", ax: 0, ay: uah / 2, bx: 0, by: -lah / 2, stiffness: 0.85, damping: 0.12 },
+    { slotA: "rua", slotB: "rla", ax: 0, ay: uah / 2, bx: 0, by: -lah / 2, stiffness: 0.85, damping: 0.12 },
+    { slotA: "torso", slotB: "lul", ax: -legX * 0.35, ay: th / 2, bx: 0, by: -ulh / 2, stiffness: 0.95, damping: 0.2 },
+    { slotA: "torso", slotB: "rul", ax: legX * 0.35, ay: th / 2, bx: 0, by: -ulh / 2, stiffness: 0.95, damping: 0.2 },
+    { slotA: "lul", slotB: "lll", ax: 0, ay: ulh / 2, bx: 0, by: -llh / 2, stiffness: 0.92, damping: 0.18 },
+    { slotA: "rul", slotB: "rll", ax: 0, ay: ulh / 2, bx: 0, by: -llh / 2, stiffness: 0.92, damping: 0.18 },
+    { slotA: "lll", slotB: "lf", ax: 0, ay: llh / 2, bx: -2 * s, by: -fh / 2, stiffness: 0.9, damping: 0.15 },
+    { slotA: "rll", slotB: "rf", ax: 0, ay: llh / 2, bx: -2 * s, by: -fh / 2, stiffness: 0.9, damping: 0.15 },
+  ];
+}
+
+/**
+ * Spawn a head-only living bud (Body Grower). Remaining parts grow via regrowMissingPart.
+ * `x,y` = head center. Optional `fruit` overrides FRUITS[fruitKey] (e.g. juice blend).
+ */
+export function createSeedHead(world, x, y, fruitKey = "melon", scale = 1, fruitOverride = null) {
+  const fruit = fruitOverride || FRUITS[fruitKey] || FRUITS.melon;
+  const s = scale;
+  const group = Body.nextGroup(true);
+  const headR = PART_SIZE.headR * s;
+  const rid = `grow-${fruitKey}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const blueprint = standardBlueprint(s);
+
+  const head = Bodies.circle(
+    x,
+    y,
+    headR,
+    partOpts(fruit, "head", { group, density: 0.0016, frictionAir: 0.2, partSlot: "head" })
+  );
+  head.plugin.ragdollId = rid;
+  head.plugin.scale = s;
+  head.plugin.baseScale = s;
+  head.plugin.fruitKey = fruitKey;
+  head.plugin.fruit = fruit;
+  head.plugin.collisionGroup = group;
+  head.plugin.blueprint = blueprint;
+  head.plugin.state = "damaged";
+  head.plugin.hp = head.plugin.maxHp * 0.25;
+  head.plugin.conscious = true;
+  head.plugin.bruises = 0.2;
+  head.plugin.detached = false;
+  head.plugin.isLiving = true;
+  head.plugin.regrowHeld = true;
+  head.plugin.growMul = 0.2;
+  head.plugin.physicsMul = 1;
+  head.plugin.growAbout = { x: 0, y: headR * 0.55 };
+  head.plugin.growAboutFull = { x: 0, y: headR * 0.55 };
+  head.plugin.growing = {
+    t: 0,
+    duration: 1.05,
+    from: 0.2,
+    to: 1,
+    parentId: null,
+    slot: "head",
+  };
+  Body.setStatic(head, true);
+  Body.setVelocity(head, { x: 0, y: 0 });
+  Body.setAngularVelocity(head, 0);
+  Body.setAngle(head, 0);
+
+  Composite.add(world, head);
+  initLivingLiquid([head], fruit);
+  if (head.plugin.liquid) {
+    head.plugin.liquid.amount = 0;
+    head.plugin.liquid.fruitMix = null;
+  }
+  return head;
+}
+
 /** Keep alive livings upright like Melon Sandbox muscle/balance. */
 export function applyStandingMuscle(bodies) {
   const byId = new Map();
@@ -1358,7 +1609,7 @@ export function applyStandingMuscle(bodies) {
     if (torso.plugin.shock) continue;
     if (torso.plugin.burn && torso.plugin.burn.intensity > 1.1) continue;
     // Don't fight regrow / budding limbs — muscle torque causes wild spins
-    if (parts.some((p) => p.plugin?.growing || p.plugin?.effects?.regrow)) continue;
+    if (parts.some((p) => p.plugin?.growing || p.plugin?.effects?.regrow || p.plugin?.effects?.machineRegrow)) continue;
 
     // KO / unconscious → limp ragdoll (dead weight)
     if (!torso.plugin.conscious) {
@@ -1452,61 +1703,234 @@ function drawBone(ctx, body, kind) {
   const { x, y } = body.position;
   const a = body.angle;
   const s = body.plugin?.scale || 1;
+  const metal = isMetalFrame(body.plugin);
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(a);
-  ctx.strokeStyle = "#e8e0d0";
-  ctx.fillStyle = "#d4ccc0";
-  ctx.lineWidth = 2.2;
-  ctx.lineCap = "round";
 
-  if (kind === "head") {
-    ctx.beginPath();
-    ctx.arc(0, 0, 10 * s, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.fillStyle = body.plugin?.conscious ? "#3a2018" : "#2a2a28";
-    ctx.beginPath();
-    ctx.arc(-4 * s, -1 * s, 2 * s, 0, Math.PI * 2);
-    ctx.arc(4 * s, -1 * s, 2 * s, 0, Math.PI * 2);
-    ctx.fill();
-    if (body.plugin?.conscious) {
-      ctx.fillStyle = "#e06080";
+  if (metal) {
+    drawMetalBone(ctx, body, kind, s);
+  } else {
+    ctx.strokeStyle = "#e8e0d0";
+    ctx.fillStyle = "#d4ccc0";
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = "round";
+
+    if (kind === "head") {
       ctx.beginPath();
-      ctx.arc(-4 * s, -1 * s, 0.7 * s, 0, Math.PI * 2);
-      ctx.arc(4 * s, -1 * s, 0.7 * s, 0, Math.PI * 2);
+      ctx.arc(0, 0, 10 * s, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = body.plugin?.conscious ? "#3a2018" : "#2a2a28";
+      ctx.beginPath();
+      ctx.arc(-4 * s, -1 * s, 2 * s, 0, Math.PI * 2);
+      ctx.arc(4 * s, -1 * s, 2 * s, 0, Math.PI * 2);
+      ctx.fill();
+      if (body.plugin?.conscious) {
+        ctx.fillStyle = "#e06080";
+        ctx.beginPath();
+        ctx.arc(-4 * s, -1 * s, 0.7 * s, 0, Math.PI * 2);
+        ctx.arc(4 * s, -1 * s, 0.7 * s, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    } else if (kind === "torso") {
+      ctx.beginPath();
+      ctx.moveTo(-6 * s, -12 * s);
+      ctx.lineTo(6 * s, -12 * s);
+      ctx.lineTo(5 * s, 12 * s);
+      ctx.lineTo(-5 * s, 12 * s);
+      ctx.closePath();
+      ctx.stroke();
+      for (let i = -1; i <= 1; i++) {
+        ctx.beginPath();
+        ctx.moveTo(-5 * s, i * 6 * s);
+        ctx.lineTo(5 * s, i * 6 * s);
+        ctx.stroke();
+      }
+    } else if (kind === "foot") {
+      ctx.beginPath();
+      ctx.moveTo(-6 * s, 0);
+      ctx.lineTo(6 * s, 0);
+      ctx.stroke();
+    } else {
+      const h = kind.includes("Arm") ? 14 * s : 16 * s;
+      ctx.beginPath();
+      ctx.moveTo(0, -h / 2);
+      ctx.lineTo(0, h / 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(0, -h / 2, 2.5 * s, 0, Math.PI * 2);
+      ctx.arc(0, h / 2, 2.5 * s, 0, Math.PI * 2);
       ctx.fill();
     }
-  } else if (kind === "torso") {
-    ctx.beginPath();
-    ctx.moveTo(-6 * s, -12 * s);
-    ctx.lineTo(6 * s, -12 * s);
-    ctx.lineTo(5 * s, 12 * s);
-    ctx.lineTo(-5 * s, 12 * s);
-    ctx.closePath();
-    ctx.stroke();
-    for (let i = -1; i <= 1; i++) {
-      ctx.beginPath();
-      ctx.moveTo(-5 * s, i * 6 * s);
-      ctx.lineTo(5 * s, i * 6 * s);
-      ctx.stroke();
-    }
-  } else if (kind === "foot") {
-    ctx.beginPath();
-    ctx.moveTo(-6 * s, 0);
-    ctx.lineTo(6 * s, 0);
-    ctx.stroke();
-  } else {
-    const h = kind.includes("Arm") ? 14 * s : 16 * s;
-    ctx.beginPath();
-    ctx.moveTo(0, -h / 2);
-    ctx.lineTo(0, h / 2);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(0, -h / 2, 2.5 * s, 0, Math.PI * 2);
-    ctx.arc(0, h / 2, 2.5 * s, 0, Math.PI * 2);
-    ctx.fill();
   }
   ctx.restore();
+}
+
+/** Brushed-steel robot frame — solid plates, rivets, joint bolts. */
+function drawMetalBone(ctx, body, kind, s) {
+  const conscious = !!body.plugin?.conscious;
+  const steel = "#6a7380";
+  const steelHi = "#b8c4d0";
+  const steelMid = "#8a96a4";
+  const steelLo = "#3a424c";
+  const edge = "#1e242c";
+
+  const rivet = (rx, ry, rr = 1.1) => {
+    ctx.beginPath();
+    ctx.arc(rx, ry, rr * s, 0, Math.PI * 2);
+    ctx.fillStyle = steelLo;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(rx - 0.35 * s, ry - 0.35 * s, rr * 0.35 * s, 0, Math.PI * 2);
+    ctx.fillStyle = steelHi;
+    ctx.fill();
+  };
+
+  const bolt = (bx, by, br = 2.6) => {
+    ctx.beginPath();
+    ctx.arc(bx, by, br * s, 0, Math.PI * 2);
+    ctx.fillStyle = steelMid;
+    ctx.fill();
+    ctx.strokeStyle = edge;
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(bx, by, br * 0.45 * s, 0, Math.PI * 2);
+    ctx.fillStyle = steelLo;
+    ctx.fill();
+    // hex glint
+    ctx.strokeStyle = steelHi;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(bx - 0.5 * s, by - 0.5 * s, br * 0.55 * s, -0.8, 0.6);
+    ctx.stroke();
+  };
+
+  if (kind === "head") {
+    // Outer helmet plate
+    ctx.beginPath();
+    ctx.arc(0, 0, 10.5 * s, 0, Math.PI * 2);
+    ctx.fillStyle = steel;
+    ctx.fill();
+    // Specular band
+    ctx.beginPath();
+    ctx.arc(-1.5 * s, -2.5 * s, 7.5 * s, -2.4, -0.4);
+    ctx.strokeStyle = steelHi;
+    ctx.lineWidth = 2.2 * s;
+    ctx.stroke();
+    // Inner recessed face
+    ctx.beginPath();
+    ctx.arc(0, 0.5 * s, 7 * s, 0, Math.PI * 2);
+    ctx.fillStyle = steelLo;
+    ctx.fill();
+    ctx.strokeStyle = edge;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, 10.5 * s, 0, Math.PI * 2);
+    ctx.stroke();
+    // Visor slit
+    ctx.fillStyle = conscious ? "#1a3040" : "#121418";
+    ctx.fillRect(-6 * s, -3.2 * s, 12 * s, 4.2 * s);
+    ctx.strokeStyle = steelMid;
+    ctx.strokeRect(-6 * s, -3.2 * s, 12 * s, 4.2 * s);
+    // Optic lights
+    ctx.fillStyle = conscious ? "#40e8ff" : "#2a3038";
+    ctx.beginPath();
+    ctx.arc(-3.2 * s, -1.1 * s, 1.6 * s, 0, Math.PI * 2);
+    ctx.arc(3.2 * s, -1.1 * s, 1.6 * s, 0, Math.PI * 2);
+    ctx.fill();
+    if (conscious) {
+      ctx.fillStyle = "#e8ffff";
+      ctx.beginPath();
+      ctx.arc(-3.5 * s, -1.4 * s, 0.55 * s, 0, Math.PI * 2);
+      ctx.arc(2.9 * s, -1.4 * s, 0.55 * s, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    rivet(-7.5 * s, -6.5 * s, 1.0);
+    rivet(7.5 * s, -6.5 * s, 1.0);
+    rivet(-7.2 * s, 7 * s, 1.0);
+    rivet(7.2 * s, 7 * s, 1.0);
+  } else if (kind === "torso") {
+    // Chassis plate
+    ctx.beginPath();
+    ctx.moveTo(-7 * s, -13 * s);
+    ctx.lineTo(7 * s, -13 * s);
+    ctx.lineTo(6.2 * s, 13 * s);
+    ctx.lineTo(-6.2 * s, 13 * s);
+    ctx.closePath();
+    ctx.fillStyle = steel;
+    ctx.fill();
+    // Left highlight / right shade
+    ctx.fillStyle = "rgba(200,220,235,0.22)";
+    ctx.fillRect(-6.5 * s, -12 * s, 3.2 * s, 24 * s);
+    ctx.fillStyle = "rgba(20,24,30,0.28)";
+    ctx.fillRect(3.2 * s, -12 * s, 3 * s, 24 * s);
+    ctx.strokeStyle = edge;
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+    // Rib / panel lines
+    ctx.strokeStyle = steelLo;
+    ctx.lineWidth = 1.2;
+    for (let i = -1; i <= 1; i++) {
+      ctx.beginPath();
+      ctx.moveTo(-5.2 * s, i * 6 * s);
+      ctx.lineTo(5.2 * s, i * 6 * s);
+      ctx.stroke();
+    }
+    // Core housing
+    ctx.fillStyle = steelLo;
+    ctx.fillRect(-3.5 * s, -4 * s, 7 * s, 8 * s);
+    ctx.strokeStyle = steelHi;
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(-3.5 * s, -4 * s, 7 * s, 8 * s);
+    ctx.fillStyle = conscious ? "#38d0e8" : "#2a3038";
+    ctx.fillRect(-1.6 * s, -1.8 * s, 3.2 * s, 3.6 * s);
+    rivet(-5.5 * s, -11 * s);
+    rivet(5.5 * s, -11 * s);
+    rivet(-5 * s, 11 * s);
+    rivet(5 * s, 11 * s);
+  } else if (kind === "foot") {
+    // Metal sole plate
+    ctx.beginPath();
+    ctx.moveTo(-7.5 * s, -2 * s);
+    ctx.lineTo(7.5 * s, -2 * s);
+    ctx.lineTo(8 * s, 2.5 * s);
+    ctx.lineTo(-8 * s, 2.5 * s);
+    ctx.closePath();
+    ctx.fillStyle = steelMid;
+    ctx.fill();
+    ctx.fillStyle = steelHi;
+    ctx.fillRect(-7 * s, -2 * s, 14 * s, 1.4 * s);
+    ctx.strokeStyle = edge;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    rivet(-5 * s, 0.4 * s, 0.9);
+    rivet(5 * s, 0.4 * s, 0.9);
+  } else {
+    const arm = kind.includes("Arm");
+    const h = arm ? 14 * s : 16 * s;
+    const w = arm ? 3.4 * s : 4.2 * s;
+    // Beam body
+    ctx.fillStyle = steel;
+    ctx.fillRect(-w / 2, -h / 2, w, h);
+    ctx.fillStyle = steelHi;
+    ctx.fillRect(-w / 2, -h / 2, w * 0.35, h);
+    ctx.fillStyle = steelLo;
+    ctx.fillRect(w * 0.15, -h / 2, w * 0.35, h);
+    ctx.strokeStyle = edge;
+    ctx.lineWidth = 1.4;
+    ctx.strokeRect(-w / 2, -h / 2, w, h);
+    // Segment seam
+    ctx.strokeStyle = steelLo;
+    ctx.beginPath();
+    ctx.moveTo(-w * 0.55, 0);
+    ctx.lineTo(w * 0.55, 0);
+    ctx.stroke();
+    bolt(0, -h / 2, 2.5);
+    bolt(0, h / 2, 2.5);
+    rivet(-w * 0.15, -h * 0.22, 0.75);
+    rivet(w * 0.15, h * 0.22, 0.75);
+  }
 }
 
 function drawFlesh(ctx, body, fruit, damaged) {

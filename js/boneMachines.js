@@ -1,6 +1,16 @@
-/** Bone melter, weapon molds, and skeleton reconnector. */
+/** Bone melter, weapon molds, skeleton reconnector, and bone repairer. */
 
-import { PART_SIZE, poseStandingCluster, reconnectJoints, setRegrowHeld, healBones, wakeLiving } from "./ragdoll.js";
+import {
+  PART_SIZE,
+  poseStandingCluster,
+  reconnectJoints,
+  setRegrowHeld,
+  healBones,
+  wakeLiving,
+  effectiveBoneMaxHp,
+  isMetalFrame,
+  setMetalFrame,
+} from "./ragdoll.js";
 import {
   createContainerVessel,
   addLiquid,
@@ -13,6 +23,29 @@ const { Body, Bodies, Composite, Query } = Matter;
 
 export const BONE_MELT_COLOR = "#d8d0c0";
 export const BONE_MELT_TYPE = "boneMelt";
+export const METAL_BONE_MELT_COLOR = "#8a9aaa";
+export const METAL_BONE_MELT_TYPE = "metalBoneMelt";
+/** Molten scrap / robot frames from the Metal Melter — forges any metal skeleton. */
+export const LIQUID_METAL_COLOR = "#c8d4e0";
+export const LIQUID_METAL_TYPE = "liquidMetal";
+
+export function isMetalMeltType(type) {
+  return (
+    type === METAL_BONE_MELT_TYPE ||
+    type === "metalBoneMelt" ||
+    type === LIQUID_METAL_TYPE ||
+    type === "liquidMetal"
+  );
+}
+
+export function isBoneMeltType(type) {
+  return (
+    type === BONE_MELT_TYPE ||
+    type === "boneMelt" ||
+    type === "hybridMelt" ||
+    isMetalMeltType(type)
+  );
+}
 
 /** Mold recipes: weapon id → melt cost. */
 export const BONE_MOLDS = {
@@ -61,6 +94,94 @@ function suckToward(parts, zone, force = 0.00004) {
   }
 }
 
+function isFleshed(body) {
+  const st = body?.plugin?.state;
+  return st === "alive" || st === "damaged";
+}
+
+function vesselIsBoneMelt(v) {
+  if (!v || v.amount < 0.5) return false;
+  return isBoneMeltType(v.type);
+}
+
+function vesselIsMetalMelt(v) {
+  return !!v && v.amount >= 0.5 && isMetalMeltType(v.type);
+}
+
+/** Metal frames need metal melt; organic accepts bone or metal (metal upgrades the frame). */
+function meltWorksForPart(v, body) {
+  if (!vesselIsBoneMelt(v)) return false;
+  if (isMetalFrame(body?.plugin) && !vesselIsMetalMelt(v) && v.type !== "hybridMelt") return false;
+  return true;
+}
+
+function spendBoneMelt(vessel, amount) {
+  if (!vessel || amount <= 0) return 0;
+  const take = Math.min(vessel.amount, amount);
+  vessel.amount -= take;
+  if (vessel.amount < 0.5) {
+    vessel.amount = 0;
+    vessel.type = "empty";
+    vessel.fromShard = false;
+  }
+  return take;
+}
+
+/** Base melt cost to mend one part (skeleton). Flesh pays 1.5×. */
+function repairMeltCost(body) {
+  const part = body?.plugin?.part || "torso";
+  let cost = 11;
+  if (part === "torso") cost = 18;
+  else if (part === "head") cost = 14;
+  else if (part === "foot") cost = 8;
+  if (isFleshed(body)) cost *= 1.5;
+  return cost;
+}
+
+/** Seconds to finish one mend (skeleton). Flesh takes 2×. */
+function repairDuration(body) {
+  return isFleshed(body) ? 1.0 : 0.5;
+}
+
+function needsBoneRepair(body) {
+  const pl = body?.plugin;
+  if (!pl?.fruit || pl.state === "gone") return false;
+  if (pl.boneBroken || pl.jointSprain) return true;
+  if (pl.lostJoints?.length) return true;
+  if (pl.state === "skeleton" && pl.hp < pl.maxHp * 0.92) return true;
+  return false;
+}
+
+function mendPart(body, world, usedMetalMelt = false) {
+  const pl = body.plugin;
+  pl.boneBroken = false;
+  pl.jointSprain = false;
+  if (usedMetalMelt) setMetalFrame(pl, true);
+  if (pl.state === "skeleton") {
+    const cap = effectiveBoneMaxHp(pl.part, pl);
+    pl.maxHp = Math.max(pl.maxHp || cap, cap);
+    pl.hp = Math.max(pl.hp, pl.maxHp * 0.9);
+  } else {
+    pl.hp = Math.min(pl.maxHp, pl.hp + pl.maxHp * 0.08);
+  }
+
+  const rid = pl.ragdollId;
+  if (!rid) return;
+  const cluster = Composite.allBodies(world).filter(
+    (b) => b.plugin?.ragdollId === rid && b.plugin.state !== "gone"
+  );
+  if (cluster.length >= 2) reconnectJoints(world, cluster, 130);
+}
+
+function ensureBodyKey(body) {
+  if (!body) return null;
+  if (body.plugin?.netId) return body.plugin.netId;
+  if (!body.plugin._repairKey) {
+    body.plugin._repairKey = `rp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  }
+  return body.plugin._repairKey;
+}
+
 // ——— Melter ———
 
 export function createBoneMelter(x, y) {
@@ -105,19 +226,110 @@ export function tickBoneMelter(melter, world, dt, particles) {
   if (melter.plugin.processT < 0.5) return;
   melter.plugin.processT = 0;
 
-  const scale = bones[0].plugin?.scale || 1;
+  // Prefer melting one frame type per batch (metal → metalBoneMelt)
+  const metalBones = bones.filter((b) => isMetalFrame(b.plugin));
+  const batch = metalBones.length ? metalBones : bones;
+  const meltType = metalBones.length ? METAL_BONE_MELT_TYPE : BONE_MELT_TYPE;
+  const meltColor = metalBones.length ? METAL_BONE_MELT_COLOR : BONE_MELT_COLOR;
+
+  const scale = batch[0].plugin?.scale || 1;
   const full = fullBodyArea(scale);
   let area = 0;
-  for (const b of bones) area += partBoneArea(b);
+  for (const b of batch) area += partBoneArea(b);
   const yieldAmt = Math.min(1, area / full) * DEFAULT_JUICE_CAPACITY;
   if (yieldAmt < 0.5) return;
 
-  addLiquid(melter.plugin.liquid, yieldAmt, BONE_MELT_TYPE, BONE_MELT_COLOR);
+  addLiquid(melter.plugin.liquid, yieldAmt, meltType, meltColor);
 
-  for (const b of bones) {
-    particles?.burst?.(b.position.x, b.position.y, BONE_MELT_COLOR, 8, 3);
-    particles?.burst?.(b.position.x, b.position.y, "#8a8070", 4, 2);
+  for (const b of batch) {
+    particles?.burst?.(b.position.x, b.position.y, meltColor, 8, 3);
+    particles?.burst?.(b.position.x, b.position.y, metalBones.length ? "#5a7080" : "#8a8070", 4, 2);
     b.plugin.state = "gone";
+  }
+}
+
+// ——— Metal Melter (scrap rods/plates + robot / metal skeletons → liquid metal) ———
+
+function metalStockYield(body) {
+  const kind = body?.plugin?.metalStock;
+  if (kind === "rod") return 38;
+  if (kind === "plate") return 58;
+  return 0;
+}
+
+function isMetalMelterFeed(body) {
+  if (!body?.plugin || body.plugin.state === "gone") return false;
+  if (body.plugin.metalStock) return metalStockYield(body) > 0;
+  return !!(body.plugin.fruit && body.plugin.state === "skeleton" && isMetalFrame(body.plugin));
+}
+
+export function createMetalMelter(x, y) {
+  const body = Bodies.rectangle(x, y, 72, 54, {
+    friction: 0.45,
+    density: 0.013,
+    chamfer: { radius: 4 },
+    label: "mach-metalMelter",
+    render: { visible: false },
+  });
+  body.plugin = {
+    draw: "metalMelter",
+    metalMelter: true,
+    processT: 0,
+    liquid: createContainerVessel({
+      amount: 0,
+      capacity: 200,
+      color: LIQUID_METAL_COLOR,
+      type: "empty",
+    }),
+  };
+  return body;
+}
+
+export function tickMetalMelter(melter, world, dt, particles) {
+  if (!melter?.plugin?.metalMelter || !melter.plugin.active) {
+    if (melter?.plugin) melter.plugin.processT = 0;
+    return;
+  }
+
+  const zone = intakeZone(melter, 12, 44, 20);
+  const feed = Query.region(Composite.allBodies(world), zone).filter(isMetalMelterFeed);
+  if (!feed.length) {
+    melter.plugin.processT = 0;
+    return;
+  }
+
+  suckToward(feed, zone, 0.000045);
+  melter.plugin.processT = (melter.plugin.processT || 0) + dt;
+  if (melter.plugin.processT < 0.55) return;
+  melter.plugin.processT = 0;
+
+  // Prefer scrap stock first, then metal skeleton limbs
+  const scrap = feed.filter((b) => b.plugin.metalStock);
+  const batch = scrap.length ? scrap.slice(0, 2) : feed.filter((b) => b.plugin.fruit).slice(0, 4);
+  if (!batch.length) return;
+
+  let yieldAmt = 0;
+  if (batch[0].plugin.metalStock) {
+    for (const b of batch) yieldAmt += metalStockYield(b);
+  } else {
+    const scale = batch[0].plugin?.scale || 1;
+    const full = fullBodyArea(scale);
+    let area = 0;
+    for (const b of batch) area += partBoneArea(b);
+    yieldAmt = Math.min(1, area / full) * DEFAULT_JUICE_CAPACITY;
+  }
+  if (yieldAmt < 0.5) return;
+
+  addLiquid(melter.plugin.liquid, yieldAmt, LIQUID_METAL_TYPE, LIQUID_METAL_COLOR);
+
+  for (const b of batch) {
+    particles?.burst?.(b.position.x, b.position.y, LIQUID_METAL_COLOR, 10, 3);
+    particles?.burst?.(b.position.x, b.position.y, "#e8a050", 5, 2);
+    if (b.plugin.fruit) {
+      b.plugin.state = "gone";
+    } else {
+      Composite.remove(world, b);
+    }
   }
 }
 
@@ -346,4 +558,109 @@ export function tickBoneReconnector(machine, world, dt, particles, groundY) {
   particles?.burst?.(torso.position.x, torso.position.y, "#e8e0d0", 16, 5);
   machine.plugin.coolDown = 2.2;
   machine.plugin._lastFixed = fixed;
+}
+
+// ——— Repairer (melt → mend bones / joints, works under flesh) ———
+
+export function createBoneRepairer(x, y) {
+  const body = Bodies.rectangle(x, y, 64, 50, {
+    friction: 0.45,
+    density: 0.012,
+    chamfer: { radius: 4 },
+    label: "mach-boneRepairer",
+    render: { visible: false },
+  });
+  body.plugin = {
+    draw: "boneRepairer",
+    boneRepairer: true,
+    processT: 0,
+    repairTargetId: null,
+    liquid: createContainerVessel({
+      amount: 0,
+      capacity: 160,
+      color: BONE_MELT_COLOR,
+      type: "empty",
+    }),
+  };
+  return body;
+}
+
+/**
+ * Pipe in bone melt, Activate, feed injured parts (fleshed or skeleton).
+ * Clears broken bones / sprains and reseats lost joints.
+ * Flesh parts take 2× time and 1.5× melt vs bare bone.
+ */
+export function tickBoneRepairer(machine, world, dt, particles) {
+  if (!machine?.plugin?.boneRepairer) return;
+  if (!machine.plugin.active) {
+    machine.plugin.processT = 0;
+    machine.plugin.repairTargetId = null;
+    return;
+  }
+
+  const tank = machine.plugin.liquid;
+  if (!vesselIsBoneMelt(tank)) {
+    machine.plugin.processT = 0;
+    machine.plugin.repairTargetId = null;
+    return;
+  }
+
+  const zone = intakeZone(machine, 12, 44, 20);
+  const injured = Query.region(Composite.allBodies(world), zone).filter(
+    (b) => needsBoneRepair(b) && meltWorksForPart(tank, b)
+  );
+  if (!injured.length) {
+    machine.plugin.processT = 0;
+    machine.plugin.repairTargetId = null;
+    return;
+  }
+
+  suckToward(injured, zone, 0.000032);
+
+  // Stick with one target so flesh timing stays consistent
+  let target =
+    injured.find((b) => ensureBodyKey(b) === machine.plugin.repairTargetId) || null;
+  if (!target) {
+    injured.sort((a, b) => repairMeltCost(a) - repairMeltCost(b));
+    target = injured[0];
+    machine.plugin.repairTargetId = ensureBodyKey(target);
+    machine.plugin.processT = 0;
+  }
+
+  if (!meltWorksForPart(tank, target)) {
+    machine.plugin.repairTargetId = null;
+    machine.plugin.processT = 0;
+    return;
+  }
+
+  const need = repairMeltCost(target);
+  if (tank.amount < need * 0.95) {
+    machine.plugin.processT = 0;
+    return;
+  }
+
+  const duration = repairDuration(target);
+  machine.plugin.processT = (machine.plugin.processT || 0) + dt;
+  const dripCol =
+    tank.color ||
+    (tank.type === LIQUID_METAL_TYPE || tank.type === "liquidMetal"
+      ? LIQUID_METAL_COLOR
+      : vesselIsMetalMelt(tank)
+        ? METAL_BONE_MELT_COLOR
+        : BONE_MELT_COLOR);
+  if (Math.random() < dt * 6) {
+    particles?.drip?.(target.position.x, target.position.y, dripCol, 1);
+  }
+  if (machine.plugin.processT < duration) return;
+  machine.plugin.processT = 0;
+
+  const usedMetal = vesselIsMetalMelt(tank) || tank.type === "hybridMelt";
+  const spent = spendBoneMelt(tank, need);
+  if (spent < need * 0.85) return;
+
+  mendPart(target, world, usedMetal);
+  particles?.burst?.(target.position.x, target.position.y, dripCol, 12, 3);
+  particles?.burst?.(target.position.x, target.position.y, usedMetal ? "#c8d8e8" : "#f0ebe0", 6, 2);
+  particles?.drip?.(machine.position.x, machine.position.y - 14, dripCol, 3);
+  machine.plugin.repairTargetId = null;
 }

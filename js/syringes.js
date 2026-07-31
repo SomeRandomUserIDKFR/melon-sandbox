@@ -15,6 +15,7 @@ import {
   tickGrowingParts,
   poseStandingCluster,
   setRegrowHeld,
+  nudgeClusterAwayFromRid,
   createFruitRagdoll,
   boneMaxHp,
   detachLimb,
@@ -437,6 +438,11 @@ function applyGrowthFromSeveredLimb(world, seedBody, particles, { duration = 16 
   if (!forked) return false;
 
   const parts = forked.cluster;
+  const oldRid = forked.oldRid;
+
+  // Push stump clear of the still-regrowing host so both don't share a footprint
+  nudgeClusterAwayFromRid(world, parts, oldRid, 120);
+
   // Calm the stump so regrow doesn't inherit a spinning launch
   for (const p of parts) {
     p.plugin.bruises = 0;
@@ -444,6 +450,7 @@ function applyGrowthFromSeveredLimb(world, seedBody, particles, { duration = 16 
     p.plugin.boneBroken = false;
     p.plugin.jointSprain = false;
     p.plugin.conscious = true;
+    p.plugin.forkedFrom = oldRid;
     if (p.plugin.state === "skeleton" || p.plugin.state === "damaged") {
       p.plugin.state = "damaged";
       p.plugin.hp = Math.max(p.plugin.hp, p.plugin.maxHp * 0.55);
@@ -451,7 +458,6 @@ function applyGrowthFromSeveredLimb(world, seedBody, particles, { duration = 16 
     if (!isFinite(p.angle) || Math.abs(p.angle) > Math.PI * 2) {
       Body.setAngle(p, 0);
     } else {
-      // Prefer near-upright stump
       let a = p.angle;
       while (a > Math.PI) a -= Math.PI * 2;
       while (a < -Math.PI) a += Math.PI * 2;
@@ -459,8 +465,12 @@ function applyGrowthFromSeveredLimb(world, seedBody, particles, { duration = 16 
     }
     Body.setVelocity(p, { x: 0, y: 0 });
     Body.setAngularVelocity(p, 0);
-    Body.set(p, { frictionAir: 0.15 });
+    Body.set(p, { frictionAir: 0.15, restitution: 0.02 });
   }
+
+  // Lock standing pose X so later torso buds don't snap back into the host
+  const cx = parts.reduce((s, p) => s + p.position.x, 0) / parts.length;
+  for (const p of parts) p.plugin.regrowPoseX = cx;
 
   startBodyGrowth(parts, { duration, fromLimb: true });
   syncLivingLiquid(parts, seedBody.plugin.fruit);
@@ -604,10 +614,15 @@ export function injectSyringe(world, hitBody, syringeId, particles, syringeBody 
     const vessel = parts.find((p) => p.plugin?.liquid)?.plugin?.liquid;
     if (vessel && vessel.amount > 0) {
       const take = Math.min(vessel.amount, vessel.capacity);
+      const mixSnap = vessel.fruitMix ? { ...vessel.fruitMix } : null;
+      const fruitKey = parts.find((p) => p.plugin?.fruitKey)?.plugin?.fruitKey;
       const lost = loseJuice(vessel, take, particles, { x: cx, y: cy });
       if (syringeBody?.plugin) {
         ensureSyringeVessel(syringeBody);
-        addLiquid(syringeBody.plugin.liquid, lost, "juice", vessel.color);
+        addLiquid(syringeBody.plugin.liquid, lost, "juice", vessel.color, {
+          fruitKey: fruitKey && fruitKey !== "mix" ? fruitKey : null,
+          fruitMix: mixSnap,
+        });
         syringeBody.plugin.used = false;
         syncSyringeFromVessel(syringeBody);
       }
@@ -911,6 +926,52 @@ function shrinkLivingPermanent(world, parts, factor) {
   }
 }
 
+/**
+ * Soften joints, kill velocity, and briefly ignore other livings so a fresh
+ * clone / slime twin doesn't collide-launch into the void.
+ */
+function calmSpawnedLiving(world, parts, settle = 1.0) {
+  if (!parts?.length) return;
+  const rid = parts[0]?.plugin?.ragdollId;
+  for (const p of parts) {
+    if (!p.plugin || p.plugin.state === "gone") continue;
+    Body.setVelocity(p, { x: 0, y: 0 });
+    Body.setAngularVelocity(p, 0);
+    Body.set(p, { restitution: 0.02, frictionAir: 0.14 });
+    if (!p.plugin._spawnCol) {
+      p.plugin._spawnCol = {
+        category: p.collisionFilter?.category ?? 0x0001,
+        mask: p.collisionFilter?.mask ?? 0xffffffff,
+        group: p.collisionFilter?.group ?? 0,
+      };
+    }
+    p.collisionFilter = {
+      ...p.collisionFilter,
+      category: 0x0004,
+      mask: 0x0001,
+      group: p.plugin.collisionGroup || p.collisionFilter?.group || 0,
+    };
+    p.plugin.spawnProtect = Math.max(p.plugin.spawnProtect || 0, settle);
+  }
+  if (!rid) return;
+  for (const c of Composite.allConstraints(world)) {
+    if (c.plugin?.isFruitJoint && c.plugin.ragdollId === rid) {
+      c.stiffness = Math.min(c.stiffness || 0.9, 0.3);
+      c.damping = Math.max(c.damping || 0.12, 0.35);
+      c.length = 0;
+    }
+  }
+}
+
+function footContactY(parts, fallbackY) {
+  let y = fallbackY;
+  for (const p of parts) {
+    if (p.plugin?.state === "gone") continue;
+    if (p.bounds?.max?.y > y) y = p.bounds.max.y;
+  }
+  return y;
+}
+
 function applySlimeSplit(world, parts, particles) {
   const torso = parts.find((p) => p.plugin?.partSlot === "torso") || parts[0];
   if (!torso?.plugin) return false;
@@ -925,32 +986,39 @@ function applySlimeSplit(world, parts, particles) {
   const vessel = parts.find((p) => p.plugin?.liquid)?.plugin?.liquid;
   const juiceAmt = vessel?.amount ?? 50;
   const juiceColor = vessel?.color;
+  const hostRid = torso.plugin.ragdollId;
 
-  // Shrink original
+  const footY = footContactY(parts, torso.position.y);
+
+  // Shrink original, then re-pose + calm so scaled joints don't detonate
   shrinkLivingPermanent(world, parts, 0.75);
   const nextSplits = splits + 1;
   for (const p of parts) {
     if (p.plugin) p.plugin.slimeSplits = nextSplits;
   }
+  if (torso) poseStandingCluster(parts, torso, footY);
+  calmSpawnedLiving(world, parts, 0.75);
 
-  // Spawn clone at same effective scale, offset to the side
-  let footY = torso.position.y;
-  for (const p of parts) {
-    if (p.bounds?.max?.y > footY) footY = p.bounds.max.y;
-  }
+  // Spawn twin well clear of the (now smaller) host
+  const gap = 90 + 55 * nextScale;
   const side = Math.random() < 0.5 ? -1 : 1;
-  const rag = createFruitRagdoll(world, torso.position.x + side * (36 + 20 * nextScale), footY, fruitKey, nextScale);
+  const spawnX = torso.position.x + side * gap;
+  const rag = createFruitRagdoll(world, spawnX, footY, fruitKey, nextScale);
   if (rag?.parts) {
     for (const p of rag.parts) {
       p.plugin.slimeSplits = nextSplits;
       p.plugin.baseScale = nextScale;
+      p.plugin.forkedFrom = hostRid;
     }
+    nudgeClusterAwayFromRid(world, rag.parts, hostRid, gap);
+    if (rag.torso) poseStandingCluster(rag.parts, rag.torso, footY);
+    calmSpawnedLiving(world, rag.parts, 1.1);
+
     const cloneVessel = rag.parts.find((p) => p.plugin?.liquid)?.plugin?.liquid;
     if (cloneVessel) {
       cloneVessel.amount = Math.min(cloneVessel.capacity, juiceAmt * 0.55);
       if (juiceColor) cloneVessel.color = juiceColor;
     }
-    // Share remaining juice on original
     if (vessel) vessel.amount = Math.min(vessel.capacity, juiceAmt * 0.55);
     particles?.burst?.(rag.torso.position.x, rag.torso.position.y, "#a0e070", 18, 5);
     particles?.burst?.(torso.position.x, torso.position.y, "#70c050", 14, 4);
@@ -964,19 +1032,29 @@ function applyCloneBud(world, parts, particles) {
   const fruitKey = torso.plugin.fruitKey || "melon";
   const parentScale = torso.plugin.scale || torso.plugin.baseScale || 1;
   const budScale = Math.max(0.28, parentScale * 0.4);
-  let footY = torso.position.y;
-  for (const p of parts) {
-    if (p.bounds?.max?.y > footY) footY = p.bounds.max.y;
-  }
+  const hostRid = torso.plugin.ragdollId;
+  const footY = footContactY(parts, torso.position.y);
+  const gap = 85 + 40 * parentScale;
+  const side = Math.random() < 0.5 ? -1 : 1;
+
   const rag = createFruitRagdoll(
     world,
-    torso.position.x + 50,
+    torso.position.x + side * gap,
     footY,
     fruitKey,
     budScale
   );
   if (!rag?.parts) return false;
-  startBodyGrowth(rag.parts, { duration: 12, fromLimb: false });
+
+  for (const p of rag.parts) {
+    p.plugin.forkedFrom = hostRid;
+    p.plugin.baseScale = budScale;
+  }
+  nudgeClusterAwayFromRid(world, rag.parts, hostRid, gap);
+  if (rag.torso) poseStandingCluster(rag.parts, rag.torso, footY);
+  // Do NOT startBodyGrowth on a full spawn — that strips joints and relaunches.
+  // Soft settle is enough for a tiny bud twin.
+  calmSpawnedLiving(world, rag.parts, 1.2);
   restoreJuice(rag.parts, 0.35);
   particles?.burst?.(rag.torso.position.x, rag.torso.position.y, "#80e0c0", 16, 5);
   return true;
@@ -1088,7 +1166,7 @@ function stickToNearby(world, parts, particles) {
       if (stuck >= 2) break;
       if (other === p || other.isStatic) continue;
       if (other.label === "ground" || other.label === "platform") continue;
-      if (other.plugin?.waterZone || other.plugin?.lavaZone) continue;
+      if (other.plugin?.waterZone || other.plugin?.lavaZone || other.plugin?.acidZone) continue;
       if (parts.includes(other)) continue;
       const dist = Math.hypot(other.position.x - p.position.x, other.position.y - p.position.y);
       if (dist > 42) continue;
@@ -1210,19 +1288,39 @@ function finishRegrowEffect(world, rid, particles, groundY) {
   tickGrowingParts(world, partsOf(world, rid), 0.05, particles, groundY);
 
   const live = partsOf(world, rid);
+  const torso = live.find((p) => p.plugin?.partSlot === "torso");
+
+  // Keep clear of the original host one last time before joints/physics return
+  const oldRid = live.find((p) => p.plugin?.forkedFrom)?.plugin?.forkedFrom;
+  if (oldRid) nudgeClusterAwayFromRid(world, live, oldRid, 110);
+
   for (const p of live) {
     if (p.plugin?.effects) p.plugin.effects.regrow = null;
-    Body.set(p, { frictionAir: 0.01 });
+    Body.set(p, { frictionAir: 0.08, restitution: 0.02 });
   }
-  const torso = live.find((p) => p.plugin?.partSlot === "torso");
-  if (torso) poseStandingCluster(live, torso, groundY);
+  if (torso) {
+    if (torso.plugin.regrowPoseX == null && live[0]?.plugin?.regrowPoseX != null) {
+      torso.plugin.regrowPoseX = live[0].plugin.regrowPoseX;
+    }
+    poseStandingCluster(live, torso, groundY);
+  }
   setRegrowHeld(live, false);
   restoreSkin(live, { clearBruises: true, full: true });
   reconnectJoints(world, live, 200);
   for (const c of Composite.allConstraints(world)) {
     if (c.plugin?.isFruitJoint && c.plugin.ragdollId === rid) {
-      c.stiffness = Math.min(c.stiffness || 0.9, 0.55);
-      c.damping = Math.max(c.damping || 0.12, 0.22);
+      // Soft weld — hard snaps were launching twin regrows into the void
+      c.stiffness = Math.min(c.stiffness || 0.9, 0.35);
+      c.damping = Math.max(c.damping || 0.12, 0.35);
+      c.length = 0;
+    }
+  }
+  for (const p of live) {
+    Body.setVelocity(p, { x: 0, y: 0 });
+    Body.setAngularVelocity(p, 0);
+    if (p.plugin) {
+      p.plugin.regrowPoseX = null;
+      p.plugin.regrowSettle = 0.85; // brief soft air-friction window
     }
   }
   wakeLiving(live);
@@ -1271,6 +1369,37 @@ function pulsePassiveStrong(world, rid, particles) {
 export function tickSyringeEffects(world, bodies, dt, particles, groundY = null) {
   // Gradual bud → limb growth
   tickGrowingParts(world, bodies, dt, particles, groundY);
+
+  // Soft landing after regrow release (high air friction briefly)
+  for (const b of bodies) {
+    if (b.plugin?.regrowSettle > 0) {
+      b.plugin.regrowSettle -= dt;
+      Body.set(b, { frictionAir: 0.1 });
+      if (b.plugin.regrowSettle <= 0) {
+        b.plugin.regrowSettle = 0;
+        Body.set(b, { frictionAir: 0.01 });
+      }
+    }
+    // Clone / slime spawn protection — restore living collisions after settle
+    if (b.plugin?.spawnProtect > 0) {
+      b.plugin.spawnProtect -= dt;
+      Body.set(b, { frictionAir: 0.12 });
+      if (b.plugin.spawnProtect <= 0) {
+        b.plugin.spawnProtect = 0;
+        const prev = b.plugin._spawnCol;
+        if (prev) {
+          b.collisionFilter = {
+            ...b.collisionFilter,
+            category: prev.category,
+            mask: prev.mask,
+            group: prev.group,
+          };
+          b.plugin._spawnCol = null;
+        }
+        Body.set(b, { frictionAir: 0.01 });
+      }
+    }
+  }
 
   const byId = new Map();
   for (const b of bodies) {
@@ -1601,7 +1730,7 @@ export function tickSyringeEffects(world, bodies, dt, particles, groundY = null)
           if (other === b || other.isStatic) continue;
           if (other.plugin?.ragdollId === pl.ragdollId) continue;
           if (other.label === "ground" || other.label === "platform") continue;
-          if (other.plugin?.waterZone || other.plugin?.lavaZone) continue;
+          if (other.plugin?.waterZone || other.plugin?.lavaZone || other.plugin?.acidZone) continue;
           const metal =
             other.plugin?.conductive ||
             other.plugin?.draw === "metal" ||

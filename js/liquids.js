@@ -24,6 +24,8 @@ export function createVessel({ type = "juice", amount = 100, capacity = 100, col
     color,
     /** After Heal: stay conscious until juice drops below this watermark. */
     surviveUntilBelow: null,
+    /** Species weights for graft / mix coloring: { melon: 40, pumpkin: 12 }. */
+    fruitMix: null,
   };
 }
 
@@ -39,12 +41,14 @@ export function juicePercent(vessel) {
 /** Shared vessel for every part in a living cluster. */
 export function initLivingLiquid(parts, fruit) {
   const amount = 78 + Math.random() * 18; // ~78–96 juice
+  const fruitKey = parts.find((p) => p.plugin?.fruitKey)?.plugin?.fruitKey || "melon";
   const vessel = createVessel({
     type: "juice",
     amount,
     capacity: DEFAULT_JUICE_CAPACITY,
     color: fruit?.juice || "#b8e86a",
   });
+  vessel.fruitMix = { [fruitKey]: amount };
   for (const p of parts) {
     if (p.plugin) p.plugin.liquid = vessel;
   }
@@ -336,7 +340,7 @@ function fleshHpFallback(part) {
 /** True if body can be a pipe endpoint (living, syringe, or liquid container). */
 export function isLiquidTarget(body) {
   if (!body?.plugin) return false;
-  if (body.plugin.liquid) return true;
+  if (body.plugin.liquid || body.plugin.liquidBone || body.plugin.liquidJuice) return true;
   if (body.plugin.syringe != null || body.plugin.draw === "syringe") {
     ensureSyringeVessel(body);
     return true;
@@ -348,7 +352,39 @@ export function isLiquidTarget(body) {
 export function getOrCreateVessel(body) {
   if (!body?.plugin) return null;
   if (body.plugin.liquid) return body.plugin.liquid;
+  if (body.plugin.liquidJuice) return body.plugin.liquidJuice;
+  if (body.plugin.liquidBone) return body.plugin.liquidBone;
   return ensureSyringeVessel(body);
+}
+
+/**
+ * Dual-tank machines (limb regrower): route bone melt ↔ bone tank, juice ↔ juice tank.
+ * @param {"src"|"dest"} role
+ */
+export function resolveTransferVessel(body, peerVessel = null, role = "dest") {
+  const pl = body?.plugin;
+  if (!pl) return null;
+  const juice = pl.liquidJuice || (pl.limbRegrower || pl.bodyGrower ? pl.liquid : null);
+  const bone = pl.liquidBone;
+  if (juice && bone) {
+    const meltTypes = new Set(["boneMelt", "hybridMelt", "crystalMelt", "metalBoneMelt", "liquidMetal"]);
+    if (role === "dest" && peerVessel) {
+      if (meltTypes.has(peerVessel.type)) return bone;
+      return juice;
+    }
+    if (role === "src") {
+      // Prefer draining whichever tank has more usable fluid
+      const boneAmt = bone.amount > 0.5 && meltTypes.has(bone.type) ? bone.amount : 0;
+      const juiceAmt =
+        juice.amount > 0.5 && !meltTypes.has(juice.type) ? juice.amount : juice.amount > 0.5 ? juice.amount : 0;
+      if (boneAmt >= juiceAmt && boneAmt > 0.5) return bone;
+      if (juiceAmt > 0.5) return juice;
+      if (bone.amount > 0.5) return bone;
+      return juice;
+    }
+    return juice;
+  }
+  return getOrCreateVessel(body);
 }
 
 /**
@@ -361,6 +397,14 @@ export function loseJuice(vessel, amount, particles, at = null) {
   const before = vessel.amount;
   vessel.amount = Math.max(0, vessel.amount - amount);
   const lost = before - vessel.amount;
+  if (lost > 0.05 && before > 0 && vessel.fruitMix) {
+    const r = vessel.amount / before;
+    for (const k of Object.keys(vessel.fruitMix)) {
+      vessel.fruitMix[k] *= r;
+      if (vessel.fruitMix[k] < 0.01) delete vessel.fruitMix[k];
+    }
+    if (!Object.keys(vessel.fruitMix).length) vessel.fruitMix = null;
+  }
   if (lost > 0.05 && particles && at) {
     const n = Math.min(14, 2 + Math.floor(lost / 3));
     particles.burst(at.x, at.y, vessel.color, n, 3 + lost * 0.15);
@@ -402,6 +446,9 @@ export function canMixLiquidTypes(a, b) {
   if (a === b) return true;
   const juicey = (t) => t === "juice" || t === "juiceMix";
   if (juicey(a) && juicey(b)) return true;
+  const metalMelts = (t) => t === "metalBoneMelt" || t === "liquidMetal";
+  // Metal / liquid metal feedstock — blend with each other only
+  if (metalMelts(a) || metalMelts(b)) return metalMelts(a) && metalMelts(b);
   const melts = new Set(["boneMelt", "crystalMelt", "hybridMelt"]);
   if (melts.has(a) && melts.has(b)) return true;
   return false;
@@ -412,6 +459,11 @@ export function mergeLiquidType(a, b) {
   if (!b || b === "empty") return a;
   if (a === b) return a;
   if ((a === "juice" || a === "juiceMix") && (b === "juice" || b === "juiceMix")) return "juice";
+  const metalMelts = (t) => t === "metalBoneMelt" || t === "liquidMetal";
+  if (metalMelts(a) || metalMelts(b)) {
+    if (a === "liquidMetal" || b === "liquidMetal") return "liquidMetal";
+    return "metalBoneMelt";
+  }
   const melts = new Set(["boneMelt", "crystalMelt", "hybridMelt"]);
   if (melts.has(a) && melts.has(b)) {
     if (a === "hybridMelt" || b === "hybridMelt") return "hybridMelt";
@@ -421,7 +473,7 @@ export function mergeLiquidType(a, b) {
 }
 
 /** Add liquid into a vessel (same type preferred; juice can dilute/replace empty). */
-export function addLiquid(vessel, amount, type = null, color = null) {
+export function addLiquid(vessel, amount, type = null, color = null, opts = null) {
   if (!vessel || amount <= 0) return 0;
   const space = vessel.capacity - vessel.amount;
   if (space <= 0) return 0;
@@ -445,6 +497,17 @@ export function addLiquid(vessel, amount, type = null, color = null) {
   vessel.amount += add;
   if (color && add > 0) {
     vessel.color = mixHexColors(vessel.color || color, before, color, add);
+  }
+  const fruitKey = opts?.fruitKey;
+  if (add > 0 && fruitKey) {
+    if (!vessel.fruitMix) vessel.fruitMix = {};
+    vessel.fruitMix[fruitKey] = (vessel.fruitMix[fruitKey] || 0) + add;
+  } else if (add > 0 && opts?.fruitMix) {
+    if (!vessel.fruitMix) vessel.fruitMix = {};
+    const srcTotal = Object.values(opts.fruitMix).reduce((s, v) => s + v, 0) || 1;
+    for (const [k, v] of Object.entries(opts.fruitMix)) {
+      vessel.fruitMix[k] = (vessel.fruitMix[k] || 0) + (v / srcTotal) * add;
+    }
   }
   // Optional 5th arg / opts: { fromShard: true } via color-null pattern — use mark below in callers
   if (vessel.amount < 0.5) vessel.fromShard = false;
@@ -488,6 +551,7 @@ export function transferLiquid(
 
   const add = Math.min(want, space);
   const destBefore = dest.amount;
+  const srcBefore = source.amount;
   source.amount -= add;
 
   if (destEmpty) {
@@ -508,12 +572,31 @@ export function transferLiquid(
     if (source.fromShard) dest.fromShard = true;
   }
 
+  // Move species mix with the juice (for Graft Vat flesh tinting)
+  if (add > 0 && srcBefore > 0) {
+    if (source.fruitMix && Object.keys(source.fruitMix).length) {
+      if (!dest.fruitMix) dest.fruitMix = {};
+      const ratio = add / srcBefore;
+      for (const [k, v] of Object.entries(source.fruitMix)) {
+        const take = v * ratio;
+        source.fruitMix[k] = Math.max(0, v - take);
+        if (source.fruitMix[k] < 0.01) delete source.fruitMix[k];
+        dest.fruitMix[k] = (dest.fruitMix[k] || 0) + take;
+      }
+      if (!Object.keys(source.fruitMix).length) source.fruitMix = null;
+    } else if (destEmpty || !dest.fruitMix) {
+      // Infer a single species from juice color isn't done here — graft matches color later
+    }
+  }
+
   if (source.amount < 0.5) {
     source.amount = 0;
+    source.fruitMix = null;
     if (source.type === "crystalMelt" || source.type === "hybridMelt") source.fromShard = false;
   }
   if (dest.amount < 0.5) {
     dest.fromShard = false;
+    dest.fruitMix = null;
   }
 
   if (add > 0 && particles) {
@@ -543,8 +626,8 @@ export function tickPipes(pipes, world, dt, particles) {
       pipes.splice(i, 1);
       continue;
     }
-    const src = getOrCreateVessel(a);
-    const dst = getOrCreateVessel(b);
+    const src = resolveTransferVessel(a, null, "src");
+    const dst = resolveTransferVessel(b, src, "dest");
     if (!src || !dst) continue;
 
     const rate = pipe.rate ?? 18;
@@ -636,7 +719,11 @@ export function healReviveLiquid(parts) {
 export function restoreJuice(parts, fraction = 0.35) {
   const vessel = syncLivingLiquid(parts, parts[0]?.plugin?.fruit);
   const add = vessel.capacity * fraction;
-  addLiquid(vessel, add, "juice", parts[0]?.plugin?.fruit?.juice || vessel.color);
+  const fk = parts[0]?.plugin?.fruitKey;
+  addLiquid(vessel, add, "juice", parts[0]?.plugin?.fruit?.juice || vessel.color, {
+    fruitKey: fk && fk !== "mix" ? fk : null,
+    fruitMix: fk === "mix" && vessel.fruitMix ? { ...vessel.fruitMix } : null,
+  });
   vessel.surviveUntilBelow = null;
   applyJuiceConsciousness(parts);
   return vessel;

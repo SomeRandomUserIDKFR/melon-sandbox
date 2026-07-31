@@ -79,10 +79,11 @@ export function tickElements(world, dt, particles, explodeFn = null) {
   const bodies = Composite.allBodies(world);
   const waterZones = bodies.filter((b) => b.plugin?.waterZone);
   const lavaZones = bodies.filter((b) => b.plugin?.lavaZone);
+  const acidZones = bodies.filter((b) => b.plugin?.acidZone);
 
   for (const b of bodies) {
     const pl = b.plugin;
-    if (!pl || b.isStatic && !pl.burn && !pl.waterZone && !pl.lavaZone) {
+    if (!pl || (b.isStatic && !pl.burn && !pl.waterZone && !pl.lavaZone && !pl.acidZone)) {
       // still process static burnables below if they have burn
     }
     if (!pl) continue;
@@ -90,6 +91,7 @@ export function tickElements(world, dt, particles, explodeFn = null) {
     // --- Water immersion ---
     let inWater = false;
     let inLava = false;
+    let inAcid = false;
     for (const z of waterZones) {
       if (z === b) continue;
       if (bodyInZone(b, z)) {
@@ -101,6 +103,13 @@ export function tickElements(world, dt, particles, explodeFn = null) {
       if (z === b) continue;
       if (bodyInZone(b, z)) {
         inLava = true;
+        break;
+      }
+    }
+    for (const z of acidZones) {
+      if (z === b) continue;
+      if (bodyInZone(b, z)) {
+        inAcid = true;
         break;
       }
     }
@@ -133,6 +142,33 @@ export function tickElements(world, dt, particles, explodeFn = null) {
       ignite(b, 1.4, 8);
       if (pl.fruit) damagePart(b, 28 * dt, particles, b.position, { silent: true });
       if (Math.random() < 0.35) particles.flame?.(b.position.x, b.position.y, 3);
+    }
+
+    // --- Acid immersion (syringe-style dissolve while in the pool) ---
+    if (inAcid && !b.isStatic) {
+      Body.applyForce(b, b.position, {
+        x: -b.velocity.x * 0.00055,
+        y: -0.0032 * Math.max(0.25, (b.area || 400) / 800) - b.velocity.y * 0.0008,
+      });
+      if (pl.fruit && pl.state !== "gone") {
+        if (!pl.effects) pl.effects = {};
+        if (!pl.effects.acid) {
+          pl.effects.acid = { t: 0, rate: 20 };
+          pl.effects.heal = null;
+          pl.effects.regen = null;
+          pl.effects.regrow = null;
+          pl.conscious = false;
+          pl.forceUnconscious = true;
+        } else {
+          pl.effects.acid.rate = Math.max(pl.effects.acid.rate || 0, 20);
+        }
+        if (Math.random() < 0.22) {
+          particles.drip?.(b.position.x + (Math.random() - 0.5) * 8, b.bounds.min.y + 2, "#c8e060", 2);
+          particles.drip?.(b.position.x, b.position.y, "#6a9020", 1);
+        }
+      } else if (Math.random() < 0.08) {
+        particles.drip?.(b.position.x + (Math.random() - 0.5) * 12, b.bounds.min.y + 4, "#a8d040", 1);
+      }
     }
 
     // --- Fire ---
