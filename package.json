@@ -1,0 +1,9 @@
+{
+  "name": "melon-sandbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gore-free Melon Sandbox recreation — juice bursts and skeletons",
+  "scripts": {
+    "start": "npx --yes serve -l 3000 ."
+  }
+}

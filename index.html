@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Melon Sandbox</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.20.0/matter.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true"></span>
+        <h1>Melon Sandbox</h1>
+      </div>
+      <div class="top-actions">
+        <button id="btn-pause" type="button" title="Pause / Resume (Space)">Pause</button>
+        <button id="btn-clear" type="button" title="Clear all">Clear</button>
+        <button id="btn-help" type="button" title="Controls">?</button>
+      </div>
+    </header>
+
+    <aside id="sidebar">
+      <section class="panel">
+        <h2>Tools</h2>
+        <div id="tool-grid" class="grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Livings</h2>
+        <div id="char-grid" class="grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Props</h2>
+        <div id="prop-grid" class="grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Machines</h2>
+        <div id="machine-grid" class="grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Elements</h2>
+        <div id="element-grid" class="grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Syringes</h2>
+        <div id="syringe-grid" class="grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Weapons</h2>
+        <div id="weapon-grid" class="grid"></div>
+      </section>
+    </aside>
+
+    <main id="stage-wrap">
+      <canvas id="world"></canvas>
+      <div id="hud">
+        <span id="hud-tool">Tool: Drag</span>
+        <span id="hud-hint">Fire · shock · water · build chaos</span>
+      </div>
+    </main>
+  </div>
+
+  <div id="help-modal" class="modal hidden" role="dialog" aria-labelledby="help-title">
+    <div class="modal-card">
+      <h2 id="help-title">Sandbox controls</h2>
+      <ul>
+        <li><strong>Spawn</strong> livings, props, machines, weapons — then experiment.</li>
+        <li><strong>Freeze</strong> locks objects. <strong>Rope</strong> links two bodies.</li>
+        <li><strong>Juice</strong> fills each living (shown on the torso). Below ~20% they go <strong>KO</strong> (unconscious).</li>
+        <li><strong>Heal</strong> revives without restoring juice — they stay up until juice drops again. <strong>Regen / Regrow</strong> restore juice (and flesh).</li>
+        <li><strong>Pipe</strong> transfers liquid source → dest. Works with livings, <strong>syringes</strong>, juice <strong>Barrels</strong>, and empty <strong>Tanks</strong>.</li>
+        <li><strong>Syringes</strong> — Acid melts flesh; Heal / Regen / Regrow as above. Regen/Regrow on a <strong>severed limb</strong> forks a new living.</li>
+        <li><strong>Poke / Gun / Boom</strong> for impacts. Juice spills, skeletons remain.</li>
+        <li><strong>Fire / Electricity / Water</strong> — Torch, Firecan, Lava ignite; Battery, Baton, Tesla, Shockpad shock (wet = worse); Water pools extinguish + buoy + drown; Sprinkler puts out fires.</li>
+        <li><kbd>Space</kbd> pause · <kbd>R</kbd> clear · scroll zoom · Alt-drag pan</li>
+      </ul>
+      <button id="help-close" type="button">Close</button>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
