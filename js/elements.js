@@ -225,12 +225,15 @@ export function tickElements(world, dt, particles, explodeFn = null) {
     // Dry off wet label slowly already handled
   }
 
-  // Active emitters: flamethrower, coil, sprinkler
+  // Active emitters: flamethrower, coil, sprinkler (respect Activate)
   for (const b of bodies) {
     const pl = b.plugin;
     if (!pl || b.isStatic) continue;
+    const powered = !pl.activatable || pl.active;
+    if (!powered) continue;
 
     if (pl.flamethrower) {
+      // Also handled in main tick; keep element path for consistency when active
       const a = b.angle - Math.PI / 2;
       const reach = 70;
       const fx = b.position.x + Math.cos(a) * 24;

@@ -5,6 +5,11 @@ const { Composite } = Matter;
 /** Living dies (unconscious) when juice falls below this % of capacity. */
 export const JUICE_DEATH_THRESHOLD = 0.2; // 20%
 
+/** Natural skin heal / clotting starts after juice stays at or above this fill. */
+export const NATURAL_REGEN_MIN = 0.9;
+/** Seconds of continuous high juice before regen begins. */
+export const NATURAL_REGEN_SUSTAIN = 2;
+
 export const DEFAULT_JUICE_CAPACITY = 100;
 
 /**
@@ -87,7 +92,246 @@ export function drainSyringeVessel(body) {
   v.amount = 0;
   v.type = "empty";
   v.color = "#c8c8c8";
+  if (body.plugin) {
+    body.plugin.extracting = false;
+    body.plugin.extractRid = null;
+  }
 }
+
+/** True if a syringe vessel is empty enough to start withdrawing juice. */
+export function isSyringeEmpty(body) {
+  const v = body?.plugin?.liquid;
+  if (!v) return !!body?.plugin?.used;
+  return v.amount <= 1 || v.type === "empty";
+}
+
+/**
+ * While an empty syringe is stabbed into a living, suck juice into it.
+ * Instant fill-to-capacity on pierce (see main collision); this tick only
+ * keeps a pierced syringe topped up if still embedded and not full yet.
+ */
+export function tickSyringeExtraction(world, bodies, dt, particles) {
+  const REACH = 42;
+
+  for (const syringe of bodies) {
+    const pl = syringe.plugin;
+    if (!pl || pl.draw !== "syringe" || !pl.extracting) continue;
+
+    ensureSyringeVessel(syringe);
+    const dest = pl.liquid;
+    if (!dest) {
+      pl.extracting = false;
+      continue;
+    }
+
+    // Already full — stop
+    if (dest.amount >= dest.capacity - 0.05) {
+      dest.amount = dest.capacity;
+      dest.type = "juice";
+      pl.extracting = false;
+      pl.extractRid = null;
+      pl.piercedLiving = null;
+      syncSyringeFromVessel(syringe);
+      continue;
+    }
+
+    // Don't overwrite an active serum fill
+    if (dest.amount > 1 && dest.type !== "juice" && dest.type !== "empty") {
+      pl.extracting = false;
+      pl.extractRid = null;
+      continue;
+    }
+
+    let best = null;
+    let bestDist = REACH;
+    for (const b of bodies) {
+      if (!b.plugin?.fruit || b.plugin.state === "gone") continue;
+      if (pl.extractRid && b.plugin.ragdollId !== pl.extractRid) continue;
+      const d = Math.hypot(b.position.x - syringe.position.x, b.position.y - syringe.position.y);
+      if (d < bestDist) {
+        bestDist = d;
+        best = b;
+      }
+    }
+
+    if (!best) {
+      pl.extracting = false;
+      pl.extractRid = null;
+      pl.piercedLiving = null;
+      continue;
+    }
+
+    // Instant draw to full capacity
+    const src = getOrCreateVessel(best) || best.plugin.liquid;
+    if (!src || src.amount <= 0.05) {
+      pl.extracting = false;
+      continue;
+    }
+
+    const need = dest.capacity - dest.amount;
+    const moved = transferLiquid(src, dest, need, particles, best.position, syringe.position, {
+      force: true,
+    });
+    if (moved > 0) {
+      dest.type = "juice";
+      dest.color = src.color || dest.color;
+      dest.amount = Math.min(dest.capacity, dest.amount);
+      pl.extractRid = best.plugin.ragdollId;
+      syncSyringeFromVessel(syringe);
+      const parts = bodies.filter((p) => p.plugin?.ragdollId === best.plugin.ragdollId);
+      applyJuiceConsciousness(parts);
+      if (particles) {
+        particles.burst(best.position.x, best.position.y, dest.color, 10, 4);
+        particles.drip(best.position.x, best.position.y, dest.color, 4);
+      }
+    }
+
+    pl.extracting = false;
+    pl.extractRid = null;
+    pl.piercedLiving = null;
+  }
+}
+
+/** Tick wound bleed — sharp pierce drips juice over a short time. */
+export function tickBleed(world, bodies, dt, particles) {
+  const seen = new Set();
+  for (const b of bodies) {
+    const pl = b.plugin;
+    if (!pl?.bleed || !pl.fruit) continue;
+    const vessel = pl.liquid;
+    if (!vessel) {
+      pl.bleed = null;
+      continue;
+    }
+    // One bleed drain per shared vessel per frame
+    const key = pl.ragdollId || b.id;
+    pl.bleed.t -= dt;
+    if (pl.bleed.t <= 0) {
+      pl.bleed = null;
+      continue;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const lost = loseJuice(vessel, pl.bleed.rate * dt, particles, b.position);
+    if (lost > 0 && particles && Math.random() < 0.25) {
+      particles.drip(b.position.x, b.position.y, vessel.color, 1);
+    }
+    const parts = bodies.filter((p) => p.plugin?.ragdollId === pl.ragdollId);
+    applyJuiceConsciousness(parts);
+  }
+}
+
+/**
+ * Passive recovery:
+ * - Natural: juice ≥90% sustained → slow skin heal + bleed clotting (1×–1.5×)
+ * - passiveStrong syringe: permanent 8× heal + limb/bone regrow
+ * - passiveWeak syringe: permanent 4× skin/clot (no limbs/bones)
+ */
+export function tickNaturalRegen(bodies, dt, particles = null) {
+  const byRid = new Map();
+  for (const b of bodies) {
+    const pl = b.plugin;
+    if (!pl?.fruit || pl.state === "gone") continue;
+    const rid = pl.ragdollId || b.id;
+    if (!byRid.has(rid)) byRid.set(rid, []);
+    byRid.get(rid).push(b);
+  }
+
+  for (const parts of byRid.values()) {
+    const vessel = parts.find((p) => p.plugin?.liquid)?.plugin?.liquid;
+    const hasStrong = parts.some((p) => p.plugin?.effects?.passiveStrong);
+    const hasWeak = parts.some((p) => p.plugin?.effects?.passiveWeak);
+
+    let rateMul = 0;
+    let healSkeleton = false;
+
+    if (hasStrong) {
+      rateMul = 8;
+      healSkeleton = true;
+    } else if (hasWeak) {
+      rateMul = 4;
+    } else if (vessel && vessel.type === "juice") {
+      const fill = juiceFill(vessel);
+      if (fill < NATURAL_REGEN_MIN) {
+        vessel.highJuiceT = 0;
+        continue;
+      }
+      vessel.highJuiceT = (vessel.highJuiceT || 0) + dt;
+      if (vessel.highJuiceT < NATURAL_REGEN_SUSTAIN) continue;
+      const band = Math.min(1, (fill - NATURAL_REGEN_MIN) / (1 - NATURAL_REGEN_MIN));
+      rateMul = 1 + 0.5 * band;
+    } else {
+      continue;
+    }
+
+    if (rateMul <= 0) continue;
+
+    // Base @1×: bruise ~28s to clear; flesh ~1.2%/s; clot tapers slowly
+    const bruiseRate = 0.035 * rateMul;
+    const hpRate = 0.012 * rateMul;
+
+    for (const b of parts) {
+      const pl = b.plugin;
+      if (!pl || pl.state === "gone") continue;
+      if (pl.state === "skeleton" && !healSkeleton) continue;
+
+      pl.bruises = Math.max(0, (pl.bruises || 0) - bruiseRate * dt);
+
+      if (pl.state === "skeleton" && healSkeleton) {
+        // Repair bone pool, then rebuild flesh over time
+        pl.hp = Math.min(pl.maxHp, pl.hp + pl.maxHp * hpRate * dt);
+        if (pl.hp >= pl.maxHp * 0.55) pl.boneBroken = false;
+        pl._fleshRegen = (pl._fleshRegen || 0) + hpRate * 0.55 * dt;
+        if (pl._fleshRegen >= 1) {
+          const fleshCap = pl.fleshMaxHp || fleshHpFallback(pl.part);
+          pl.maxHp = fleshCap;
+          pl.hp = fleshCap * 0.55;
+          pl.state = "damaged";
+          pl.fleshMaxHp = null;
+          pl._fleshRegen = 0;
+          pl.boneBroken = false;
+          pl.jointSprain = false;
+        }
+      } else if ((pl.state === "alive" || pl.state === "damaged") && pl.hp < pl.maxHp) {
+        pl.hp = Math.min(pl.maxHp, pl.hp + pl.maxHp * hpRate * dt);
+      }
+
+      if (
+        pl.state === "damaged" &&
+        pl.hp >= pl.maxHp * 0.92 &&
+        (pl.bruises || 0) < 0.12
+      ) {
+        pl.state = "alive";
+      }
+
+      if (pl.bleed) {
+        pl.bleed.rate = Math.max(0, pl.bleed.rate - 1.05 * rateMul * dt);
+        pl.bleed.t -= 0.5 * rateMul * dt;
+        if (pl.bleed.rate < 0.35 || pl.bleed.t <= 0) pl.bleed = null;
+      }
+    }
+
+    if (particles && Math.random() < 0.035 * Math.min(rateMul, 4)) {
+      const torso =
+        parts.find((p) => p.plugin?.partSlot === "torso" || p.plugin?.part === "torso") ||
+        parts[0];
+      const col = hasStrong
+        ? "#90e0c0"
+        : hasWeak
+          ? "#70d090"
+          : vessel?.color || "#c8e878";
+      if (torso) particles.drip(torso.position.x, torso.position.y, col, 1);
+    }
+  }
+}
+
+function fleshHpFallback(part) {
+  if (part === "torso") return 100;
+  if (part === "head") return 55;
+  return 40;
+}
+
 
 /** True if body can be a pipe endpoint (living, syringe, or liquid container). */
 export function isLiquidTarget(body) {
@@ -113,6 +357,7 @@ export function getOrCreateVessel(body) {
  */
 export function loseJuice(vessel, amount, particles, at = null) {
   if (!vessel || amount <= 0) return 0;
+  if (vessel.preserve) amount *= 0.08;
   const before = vessel.amount;
   vessel.amount = Math.max(0, vessel.amount - amount);
   const lost = before - vessel.amount;
@@ -122,6 +367,57 @@ export function loseJuice(vessel, amount, particles, at = null) {
     particles.drip(at.x, at.y, vessel.color, Math.min(8, n));
   }
   return lost;
+}
+
+/** Parse #rgb / #rrggbb → [r,g,b]. */
+export function parseHexColor(hex) {
+  if (!hex || typeof hex !== "string") return [180, 200, 100];
+  let h = hex.trim().replace("#", "");
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  if (h.length !== 6) return [180, 200, 100];
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+
+export function toHexColor(r, g, b) {
+  const c = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
+  return `#${c(r)}${c(g)}${c(b)}`;
+}
+
+/** Weighted mix of two colors by liquid amounts. */
+export function mixHexColors(colorA, amountA, colorB, amountB) {
+  const a = Math.max(0, amountA);
+  const b = Math.max(0, amountB);
+  const t = a + b;
+  if (t <= 0) return colorB || colorA || "#b8e86a";
+  if (a <= 0) return colorB || colorA;
+  if (b <= 0) return colorA || colorB;
+  const [r1, g1, b1] = parseHexColor(colorA);
+  const [r2, g2, b2] = parseHexColor(colorB);
+  return toHexColor((r1 * a + r2 * b) / t, (g1 * a + g2 * b) / t, (b1 * a + b2 * b) / t);
+}
+
+/** Types that blend together instead of rejecting. */
+export function canMixLiquidTypes(a, b) {
+  if (!a || !b || a === "empty" || b === "empty") return true;
+  if (a === b) return true;
+  const juicey = (t) => t === "juice" || t === "juiceMix";
+  if (juicey(a) && juicey(b)) return true;
+  const melts = new Set(["boneMelt", "crystalMelt", "hybridMelt"]);
+  if (melts.has(a) && melts.has(b)) return true;
+  return false;
+}
+
+export function mergeLiquidType(a, b) {
+  if (!a || a === "empty") return b;
+  if (!b || b === "empty") return a;
+  if (a === b) return a;
+  if ((a === "juice" || a === "juiceMix") && (b === "juice" || b === "juiceMix")) return "juice";
+  const melts = new Set(["boneMelt", "crystalMelt", "hybridMelt"]);
+  if (melts.has(a) && melts.has(b)) {
+    if (a === "hybridMelt" || b === "hybridMelt") return "hybridMelt";
+    if (a !== b) return "hybridMelt";
+  }
+  return b || a;
 }
 
 /** Add liquid into a vessel (same type preferred; juice can dilute/replace empty). */
@@ -136,16 +432,29 @@ export function addLiquid(vessel, amount, type = null, color = null) {
     if (color) vessel.color = color;
   }
 
-  // Mixing different types: only allow if dest nearly empty
+  // Mixing: allow juice↔juice and melt↔melt with color blend
   if (type && vessel.type && type !== vessel.type && vessel.amount > 1) {
-    return 0;
+    if (!canMixLiquidTypes(vessel.type, type)) return 0;
+    vessel.type = mergeLiquidType(vessel.type, type);
+  } else if (type) {
+    vessel.type = vessel.amount <= 0.01 ? type : mergeLiquidType(vessel.type, type);
   }
-  if (type) vessel.type = type;
-  if (color && vessel.amount < 1) vessel.color = color;
 
+  const before = vessel.amount;
   const add = Math.min(space, amount);
   vessel.amount += add;
+  if (color && add > 0) {
+    vessel.color = mixHexColors(vessel.color || color, before, color, add);
+  }
+  // Optional 5th arg / opts: { fromShard: true } via color-null pattern — use mark below in callers
+  if (vessel.amount < 0.5) vessel.fromShard = false;
   return add;
+}
+
+/** Mark vessel contents as coming from smelted juice shards. */
+export function markFromShard(vessel, on = true) {
+  if (!vessel) return;
+  vessel.fromShard = !!on && vessel.amount > 0.5;
 }
 
 /**
@@ -174,16 +483,38 @@ export function transferLiquid(
 
   const destEmpty = dest.amount <= 0.01 || dest.type === "empty";
   const sameType = dest.type === source.type;
-  if (!force && !destEmpty && !sameType) return 0;
+  const mixable = canMixLiquidTypes(dest.type, source.type);
+  if (!force && !destEmpty && !sameType && !mixable) return 0;
 
   const add = Math.min(want, space);
+  const destBefore = dest.amount;
   source.amount -= add;
 
-  if (destEmpty || force) {
+  if (destEmpty) {
     dest.type = source.type;
     dest.color = source.color;
+    dest.amount += add;
+    dest.fromShard = !!source.fromShard;
+  } else if (force && !mixable) {
+    dest.type = source.type;
+    dest.color = source.color;
+    dest.amount += add;
+    dest.fromShard = !!source.fromShard;
+  } else {
+    dest.type = mergeLiquidType(dest.type, source.type);
+    dest.color = mixHexColors(dest.color || source.color, destBefore, source.color || dest.color, add);
+    dest.amount += add;
+    // Crystal/hybrid melt keeps shard provenance if either side was smelted
+    if (source.fromShard) dest.fromShard = true;
   }
-  dest.amount += add;
+
+  if (source.amount < 0.5) {
+    source.amount = 0;
+    if (source.type === "crystalMelt" || source.type === "hybridMelt") source.fromShard = false;
+  }
+  if (dest.amount < 0.5) {
+    dest.fromShard = false;
+  }
 
   if (add > 0 && particles) {
     if (fromPos) particles.drip(fromPos.x, fromPos.y, source.color || dest.color, 2);

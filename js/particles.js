@@ -1,11 +1,20 @@
 /** Juice splash, flame, spark & debris particles (no gore). */
 
+const MAX_PARTICLES = 320;
+
 export class ParticleSystem {
   constructor() {
     this.particles = [];
   }
 
+  _room(n = 1) {
+    const over = this.particles.length + n - MAX_PARTICLES;
+    if (over > 0) this.particles.splice(0, over);
+  }
+
   burst(x, y, color, count = 18, speed = 6) {
+    count = Math.min(count, 24);
+    this._room(count);
     for (let i = 0; i < count; i++) {
       const a = Math.random() * Math.PI * 2;
       const s = speed * (0.35 + Math.random() * 0.9);
@@ -14,9 +23,9 @@ export class ParticleSystem {
         y,
         vx: Math.cos(a) * s,
         vy: Math.sin(a) * s - 2,
-        life: 0.55 + Math.random() * 0.55,
-        maxLife: 1,
-        size: 2 + Math.random() * 5,
+        life: 0.45 + Math.random() * 0.4,
+        maxLife: 0.9,
+        size: 2 + Math.random() * 4,
         color,
         drip: Math.random() > 0.45,
         kind: "burst",
@@ -25,15 +34,17 @@ export class ParticleSystem {
   }
 
   drip(x, y, color, count = 6) {
+    count = Math.min(count, 8);
+    this._room(count);
     for (let i = 0; i < count; i++) {
       this.particles.push({
         x: x + (Math.random() - 0.5) * 8,
         y: y + (Math.random() - 0.5) * 4,
         vx: (Math.random() - 0.5) * 1.5,
         vy: 1 + Math.random() * 3,
-        life: 0.4 + Math.random() * 0.5,
-        maxLife: 1,
-        size: 1.5 + Math.random() * 3,
+        life: 0.35 + Math.random() * 0.4,
+        maxLife: 0.85,
+        size: 1.5 + Math.random() * 2.5,
         color,
         drip: true,
         kind: "drip",
@@ -42,15 +53,17 @@ export class ParticleSystem {
   }
 
   flame(x, y, count = 3) {
+    count = Math.min(count, 4);
+    this._room(count);
     for (let i = 0; i < count; i++) {
       this.particles.push({
         x: x + (Math.random() - 0.5) * 6,
         y: y + (Math.random() - 0.5) * 4,
         vx: (Math.random() - 0.5) * 1.2,
         vy: -2.5 - Math.random() * 3.5,
-        life: 0.25 + Math.random() * 0.35,
-        maxLife: 0.55,
-        size: 3 + Math.random() * 5,
+        life: 0.22 + Math.random() * 0.28,
+        maxLife: 0.5,
+        size: 3 + Math.random() * 4,
         color: Math.random() > 0.4 ? "#ff9040" : "#ffe060",
         drip: false,
         kind: "flame",
@@ -60,6 +73,8 @@ export class ParticleSystem {
   }
 
   spark(x, y, count = 6) {
+    count = Math.min(count, 8);
+    this._room(count);
     for (let i = 0; i < count; i++) {
       const a = Math.random() * Math.PI * 2;
       const s = 3 + Math.random() * 7;
@@ -80,6 +95,7 @@ export class ParticleSystem {
   }
 
   bubble(x, y, count = 1) {
+    this._room(count);
     for (let i = 0; i < count; i++) {
       this.particles.push({
         x: x + (Math.random() - 0.5) * 6,
@@ -111,27 +127,24 @@ export class ParticleSystem {
   }
 
   draw(ctx) {
+    // Cheap filled squares beat arc/ellipse per particle on the GPU
     for (const p of this.particles) {
       const a = Math.max(0, p.life / (p.maxLife || 1));
       ctx.globalAlpha = a;
       ctx.fillStyle = p.color;
-      ctx.beginPath();
+      const s = p.size;
       if (p.kind === "flame") {
-        ctx.ellipse(p.x, p.y, p.size * 0.55, p.size * 0.9, 0, 0, Math.PI * 2);
+        ctx.fillRect(p.x - s * 0.35, p.y - s * 0.55, s * 0.7, s * 1.1);
       } else if (p.kind === "bubble") {
-        ctx.strokeStyle = "rgba(200,230,245,0.8)";
+        ctx.globalAlpha = a * 0.55;
+        ctx.strokeStyle = "rgba(200,230,245,0.7)";
         ctx.lineWidth = 1;
-        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.globalAlpha = a * 0.25;
-        ctx.fill();
-        continue;
+        ctx.strokeRect(p.x - s, p.y - s, s * 2, s * 2);
       } else if (p.drip) {
-        ctx.ellipse(p.x, p.y, p.size * 0.55, p.size, 0, 0, Math.PI * 2);
+        ctx.fillRect(p.x - s * 0.35, p.y - s * 0.55, s * 0.7, s * 1.15);
       } else {
-        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fillRect(p.x - s * 0.5, p.y - s * 0.5, s, s);
       }
-      ctx.fill();
     }
     ctx.globalAlpha = 1;
   }

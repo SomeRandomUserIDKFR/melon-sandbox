@@ -37,6 +37,7 @@ body {
   grid-template-columns: 232px 1fr;
   grid-template-rows: 48px 1fr;
   height: 100%;
+  position: relative;
 }
 
 #topbar {
@@ -265,6 +266,143 @@ body {
 
 .modal-card button:hover {
   background: #4a535e;
+}
+
+#map-select {
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 0.78rem;
+  background: #2a2f35;
+  color: var(--ink);
+  border: 1px solid #454c56;
+  border-radius: 4px;
+  padding: 5px 8px;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 148px;
+  background: #25292e;
+  border: 1px solid #454c56;
+  border-radius: 6px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+  padding: 4px;
+  pointer-events: auto;
+}
+
+.context-menu.hidden {
+  display: none;
+}
+
+.context-title {
+  padding: 6px 10px 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.context-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 0.8rem;
+  padding: 8px 10px;
+  margin: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.context-item:hover:not(:disabled) {
+  background: #353b43;
+}
+
+.context-item.danger {
+  color: #e0a090;
+}
+
+.context-item.danger:hover:not(:disabled) {
+  background: #3a2420;
+}
+
+.context-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.context-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: #3a4048;
+}
+
+#btn-mp.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mp-panel {
+  position: absolute;
+  top: 52px;
+  right: 12px;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 160px;
+  padding: 10px 12px;
+  background: rgba(30, 33, 37, 0.92);
+  border: 1px solid #3a4048;
+  border-radius: var(--radius);
+  font-size: 0.78rem;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.mp-panel.hidden {
+  display: none;
+}
+
+.mp-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #111;
+  box-shadow: 0 0 8px currentColor;
+}
+
+.mp-status {
+  color: var(--ink);
+}
+
+.mp-peers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mp-peers li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+}
+
+.mp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
 
 @media (max-width: 720px) {

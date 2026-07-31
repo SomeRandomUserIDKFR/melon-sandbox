@@ -2,8 +2,19 @@
   "name": "melon-sandbox",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Gore-free Melon Sandbox recreation — juice bursts and skeletons",
   "scripts": {
-    "start": "npx --yes serve -l 3000 ."
+    "dev": "vite --host",
+    "start": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview --host"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.4",
+    "vite": "^6.3.5"
+  },
+  "dependencies": {
+    "ws": "^8.21.1"
   }
 }

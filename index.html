@@ -18,11 +18,22 @@
         <h1>Melon Sandbox</h1>
       </div>
       <div class="top-actions">
+        <select id="map-select" title="World map" aria-label="Map"></select>
         <button id="btn-pause" type="button" title="Pause / Resume (Space)">Pause</button>
+        <button id="btn-save" type="button" title="Save scene">Save</button>
+        <button id="btn-load" type="button" title="Load scene">Load</button>
         <button id="btn-clear" type="button" title="Clear all">Clear</button>
+        <button id="btn-mp" type="button" title="Join LAN multiplayer">MP Join</button>
         <button id="btn-help" type="button" title="Controls">?</button>
+        <input id="load-file" type="file" accept="application/json,.json" hidden />
       </div>
     </header>
+
+    <div id="mp-panel" class="mp-panel hidden">
+      <span id="mp-swatch" class="mp-swatch" title="Your color"></span>
+      <span id="mp-status" class="mp-status">Offline</span>
+      <ul id="mp-peers" class="mp-peers"></ul>
+    </div>
 
     <aside id="sidebar">
       <section class="panel">
@@ -42,12 +53,20 @@
         <div id="machine-grid" class="grid"></div>
       </section>
       <section class="panel">
+        <h2>Vehicles</h2>
+        <div id="vehicle-grid" class="grid"></div>
+      </section>
+      <section class="panel">
         <h2>Elements</h2>
         <div id="element-grid" class="grid"></div>
       </section>
       <section class="panel">
         <h2>Syringes</h2>
         <div id="syringe-grid" class="grid"></div>
+      </section>
+      <section class="panel">
+        <h2>Clothes</h2>
+        <div id="cloth-grid" class="grid"></div>
       </section>
       <section class="panel">
         <h2>Weapons</h2>
@@ -59,7 +78,7 @@
       <canvas id="world"></canvas>
       <div id="hud">
         <span id="hud-tool">Tool: Drag</span>
-        <span id="hud-hint">Fire · shock · water · build chaos</span>
+        <span id="hud-hint">Drag empty space to pan · Right-click / double-click living</span>
       </div>
     </main>
   </div>
@@ -69,14 +88,26 @@
       <h2 id="help-title">Sandbox controls</h2>
       <ul>
         <li><strong>Spawn</strong> livings, props, machines, weapons — then experiment.</li>
-        <li><strong>Freeze</strong> locks objects. <strong>Rope</strong> links two bodies.</li>
+        <li><strong>MP</strong> — LAN multiplayer. First joiner is host; share the Network URL. Dragged/selected objects glow each player’s color. Host resyncs the scene automatically when things change.</li>
+        <li><strong>Right-click</strong> or <strong>double-click</strong> a living for orders: <strong>Walk</strong>, <strong>Fight</strong>, <strong>Flee</strong>, <strong>Follow</strong>, or Stop — plus Activate / Freeze / Kill.</li>
+        <li><strong>Activate</strong> turns machines, guns, bombs, and vehicles on/off (off by default).</li>
+        <li><strong>Rope / Soft / Weld / Pin / Signal</strong> — soft links, rigid welds, wall pins, and activation wires.</li>
+        <li><strong>Grip</strong> — click near a hand and/or item to make the living hold it (snaps into the palm). Click a held item or occupied hand to drop. Guns fire when Activated.</li>
+        <li><strong>Slice</strong> — clean limb cuts. <strong>Pliers</strong> — cut ropes, welds, pins, signal wires, pipes, and grips. <strong>Platform</strong> — drag to place map editor slabs.</li>
+        <li><strong>Squeezer</strong> (Activate) — feed skinned limbs/bodies/corpses into the top; juice yield scales with part size (empty full corpse ≈ 50%, full juice ≈ 150%). Leaves <strong>bones</strong> behind; skeleton parts don’t count.</li>
+        <li><strong>Bone Melter</strong> — melts skeleton parts into bone melt (pipeable). <strong>Sword / Spike / Axe / Club Molds</strong> cast bone weapons when filled + Activated. <strong>Bone Join</strong> realigns and reconnects scattered bones into a standing skeleton.</li>
+        <li><strong>Sensor / Button / Toggle</strong> + Signal wire = activation circuits.</li>
+        <li><strong>Clothes</strong> — touch a living (or Equip) for hat, helmet, vest, cloak.</li>
+        <li><strong>Save / Load</strong> stores the scene (download + browser autosave).</li>
+        <li>Maps: <strong>Lab / Yard / Warehouse / Highway / Void / Bone Lab</strong>.</li>
         <li><strong>Juice</strong> fills each living (shown on the torso). Below ~20% they go <strong>KO</strong> (unconscious).</li>
         <li><strong>Heal</strong> revives without restoring juice — they stay up until juice drops again. <strong>Regen / Regrow</strong> restore juice (and flesh).</li>
         <li><strong>Pipe</strong> transfers liquid source → dest. Works with livings, <strong>syringes</strong>, juice <strong>Barrels</strong>, and empty <strong>Tanks</strong>.</li>
-        <li><strong>Syringes</strong> — Acid melts flesh; Heal / Regen / Regrow as above. Regen/Regrow on a <strong>severed limb</strong> forks a new living.</li>
+        <li><strong>Juice loop</strong> — juices mix by color. <strong>Crystallizer</strong> → shards → <strong>Shard Smelter</strong> (required) → crystal melt. Molds: bone melt = ivory; crystal/hybrid only from <strong>smelted shards</strong> (tint / hybrid bone).</li>
+        <li><strong>Pierce weapons</strong> (sword, axe, spike) — tip-first stabs bleed juice for a few seconds.</li>
         <li><strong>Poke / Gun / Boom</strong> for impacts. Juice spills, skeletons remain.</li>
         <li><strong>Fire / Electricity / Water</strong> — Torch, Firecan, Lava ignite; Battery, Baton, Tesla, Shockpad shock (wet = worse); Water pools extinguish + buoy + drown; Sprinkler puts out fires.</li>
-        <li><kbd>Space</kbd> pause · <kbd>R</kbd> clear · scroll zoom · Alt-drag pan</li>
+        <li><kbd>Space</kbd> pause · <kbd>R</kbd> clear · scroll zoom · drag empty space to pan</li>
       </ul>
       <button id="help-close" type="button">Close</button>
     </div>
